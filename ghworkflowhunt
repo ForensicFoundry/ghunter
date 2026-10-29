@@ -1,0 +1,1477 @@
+#!/usr/bin/env python3
+"""
+ghworkflowhunt - DFIR triage for malicious GitHub Actions workflows.
+
+For each repo (owner/name):
+  1. Mirror-clones it (all branches, tags, and refs/pull/*) into an evidence dir,
+     with gc disabled so nothing gets pruned.
+  2. (API) Pulls every workflow run created on/after --since, saves the raw JSON,
+     fetches the exact workflow YAML that ran (by head_sha, so it works even if the
+     file or branch was deleted afterward), and flags runs matching your patterns.
+     For flagged runs it downloads logs, job details, and artifacts, and fetches
+     the run's head commit into the mirror under refs/dfir/runs/<run_id>.
+  3. (Git) Walks every commit in every ref that touched .github/, and records which
+     patterns appear on added (+) or removed (-) lines. Removed-line hits catch
+     "add workflow, let it run, delete it" cleanup.
+  4. Flags ref names (branches/tags) matching the strong patterns.
+  5. Writes a SHA-256 manifest of everything collected.
+
+  Patterns come in two tiers:
+    strong      attack-specific (mkdir out, toJSON(secrets)); one hit flags.
+                Every strong-flagged run gets full evidence collection.
+    weak        common in normal workflows (curl, wget, base64, upload-artifact,
+                pull_request_target). Always recorded in the TSVs for context, but
+                they flag only when --weak-threshold distinct ones (default 2)
+                appear together. A weak-combo workflow version is collected
+                once; later runs of the same version get run.json only and point
+                to the collected run in the evidence_run_id column.
+
+  At the end it prints a formatted report to stdout and saves a plain-text copy
+  to <out>/summary.txt (latest) and <out>/summary_<timestamp>.txt. The report
+  separates attacker workflows that actually executed from ones that never ran
+  (held for approval, skipped, or failed to start; those never produce logs or
+  artifacts), and lists "Evidence gaps": runs that executed but whose logs or
+  expected artifacts are missing.
+
+  For each attacker run that executed, it reads the run's own logs to see what
+  the upload step did (artifact ID, size, SHA-256, or "No files were found"),
+  then looks up each logged artifact ID in the API. An ID that existed and now
+  returns 404 before its retention ran out is reported as DELETED. With
+  --audit-log (org owner token), it also pulls artifact.destroy and
+  checks.delete_logs events from the org audit log and matches them by ID.
+
+  Tables are tab-separated (.tsv). Color is used only when stderr is a
+  terminal; set NO_COLOR=1 or pass --no-color to turn it off.
+
+Usage:
+  Set GITHUB_TOKEN near the top of this file (or export it in your shell),
+  using a token from a CLEAN account; read-only public access is enough.
+  The token is checked against GitHub before any work starts.
+
+  python3 ghworkflowhunt owner/repo1 owner/repo2 --since 2026-10-23 --out evidence
+
+  Add patterns (strong / weak), or change how many weak hits it takes to flag:
+  python3 ghworkflowhunt owner/repo --pattern 'exfil' --weak-pattern 'webhook\\.site'
+  python3 ghworkflowhunt owner/repo --weak-threshold 3
+  python3 ghworkflowhunt owner/repo --weak-threshold 0     # strong only
+
+  Replace all built-in patterns:
+  python3 ghworkflowhunt owner/repo --only-patterns --pattern 'foo_' --weak-pattern 'curl'
+
+Requires: Python 3.8+, git on PATH. No third-party packages.
+"""
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Paste your token here. Leave it empty to fall back to the GITHUB_TOKEN or
+# GH_TOKEN environment variable instead.
+GITHUB_TOKEN = ""
+
+# Optional, only used with --audit-log: a token from an ORG OWNER with the
+# read:audit_log scope (audit log API requires GitHub Enterprise Cloud).
+# Leave empty to reuse GITHUB_TOKEN.
+AUDIT_LOG_TOKEN = ""
+# ---------------------------------------------------------------------------
+
+API = "https://api.github.com"
+
+# Strong: specific to this attack. One hit flags a run/commit/ref.
+STRONG_PATTERNS = [
+    r"mkdir\s+(-p\s+)?out\b",
+    r"toJSON\(\s*secrets\s*\)",
+]
+
+# Weak: common in legitimate workflows. Recorded for context; they flag only
+# when at least --weak-threshold different weak patterns appear together.
+WEAK_PATTERNS = [
+    r"base64",
+    r"upload-artifact",
+    r"\bcurl\b",
+    r"\bwget\b",
+    r"pull_request_target",
+]
+WEAK_THRESHOLD = 2
+
+# Short names used in the report and TSVs (custom patterns show as the regex)
+PATTERN_LABELS = {
+    r"mkdir\s+(-p\s+)?out\b": "mkdir out", r"toJSON\(\s*secrets\s*\)": "toJSON(secrets)",
+    r"base64": "base64", r"upload-artifact": "upload-artifact", r"\bcurl\b": "curl",
+    r"\bwget\b": "wget", r"pull_request_target": "pull_request_target",
+}
+
+
+def label(p):
+    return PATTERN_LABELS.get(p, p)
+
+
+def labels(pats):
+    return ", ".join(dict.fromkeys(label(p) for p in pats))
+
+WORKFLOW_PATHS = [".github"]
+
+
+__version__ = "26.09.01"
+
+if os.name == "nt":
+    os.system("")  # enables ANSI color handling in Windows 10+ consoles
+
+# --------------------------------------------------------------------------- output
+
+
+def _color_enabled(stream):
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return hasattr(stream, "isatty") and stream.isatty() and os.environ.get("TERM") != "dumb"
+
+
+USE_COLOR = _color_enabled(sys.stderr)
+USE_COLOR_OUT = _color_enabled(sys.stdout)
+_STYLES = {"info": "", "ok": "32", "warn": "33", "error": "1;31",
+           "flag": "1;35", "head": "1;36", "dim": "2"}
+
+
+def paint(text, style, enabled=None):
+    code = _STYLES.get(style, style)
+    on = USE_COLOR if enabled is None else enabled
+    return f"\033[{code}m{text}\033[0m" if on and code else text
+
+
+def log(msg, level="info"):
+    ts = paint(datetime.now().strftime("%H:%M:%S"), "dim")
+    print(f"[{ts}] {paint(msg, level)}", file=sys.stderr)
+
+
+def die(msg):
+    log(msg, "error")
+    sys.exit(1)
+
+
+_REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{1,100}$")
+
+
+def normalize_repos(args, allow_paths=False):
+    """Accept repos as separate args, one quoted space/comma-separated string (zsh
+    doesn't split $VAR), or GitHub URLs. Returns a de-duplicated, validated list."""
+    out, bad = [], []
+    for arg in args:
+        for item in re.split(r"[\s,]+", arg.strip()):
+            if not item:
+                continue
+            if allow_paths and Path(item).exists():
+                out.append(item)
+                continue
+            item = re.sub(r"^(?:https?://|git@)?(?:www\.)?github\.com[/:]", "", item)
+            item = re.sub(r"(?:\.git)?/?$", "", item)
+            (out if _REPO_RE.match(item) else bad).append(item)
+    if bad:
+        die("Not a valid owner/repo: " + ", ".join(bad))
+    return list(dict.fromkeys(out))
+
+
+def write_tsv(path, rows, fields=None):
+    """Tab-separated output; tabs/newlines inside values become spaces."""
+    fields = fields or (list(rows[0].keys()) if rows else [])
+
+    def clean(v):
+        return re.sub(r"[\t\r\n]+", " ", "" if v is None else str(v))
+
+    with path.open("w", encoding="utf-8", newline="") as f:
+        f.write("\t".join(fields) + "\n")
+        for r in rows:
+            f.write("\t".join(clean(r.get(k, "")) for k in fields) + "\n")
+
+
+# --------------------------------------------------------------------------- HTTP
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    # Log/artifact downloads redirect to presigned blob URLs; we must NOT forward
+    # the Authorization header there, so redirects are handled manually.
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def gh(path, token, params=None):
+    url = path if path.startswith("http") else API + path
+    if params:
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "ghworkflowhunt",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    for _ in range(6):
+        try:
+            resp = _OPENER.open(urllib.request.Request(url, headers=headers), timeout=120)
+            return resp.status, resp.headers, resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code in (301, 302, 303, 307, 308):
+                return e.code, e.headers, b""
+            limited = e.headers.get("X-RateLimit-Remaining") == "0" or e.headers.get("Retry-After")
+            if e.code in (403, 429) and limited:
+                reset = e.headers.get("Retry-After") or (
+                    int(e.headers.get("X-RateLimit-Reset", time.time() + 60)) - int(time.time()))
+                wait = max(5, min(int(reset), 900))
+                log(f"rate limited, sleeping {wait}s", "warn")
+                time.sleep(wait)
+                continue
+            return e.code, e.headers, e.read()
+        except urllib.error.URLError as e:
+            log(f"network error {e}; retrying", "warn")
+            time.sleep(5)
+    raise RuntimeError(f"giving up on {url}")
+
+
+def gh_json(path, token, params=None):
+    status, _, body = gh(path, token, params)
+    if status != 200:
+        log(f"  API {status} for {path}: {body[:200]!r}", "warn")
+        return None
+    return json.loads(body)
+
+
+def validate_token(token):
+    """Exit early with a clear message if the token is missing, bad, or exhausted."""
+    status, _, body = gh("/rate_limit", token)
+    if status == 401:
+        die("Token rejected by GitHub (401). It may be mistyped, expired, or revoked.")
+    if status != 200:
+        die(f"Could not validate token (HTTP {status}): {body[:200]!r}")
+    core = json.loads(body).get("resources", {}).get("core", {})
+    limit, remaining = core.get("limit", 0), core.get("remaining", 0)
+    if limit <= 60:
+        die("GitHub treated the request as unauthenticated (limit 60/hr). "
+                 "Check the token value.")
+    who = ""
+    s2, _, b2 = gh("/user", token)
+    if s2 == 200:
+        who = f" as {json.loads(b2).get('login')}"
+    log(f"Token OK{who}: {remaining}/{limit} API calls remaining this hour", "ok")
+    if remaining < 100:
+        reset = datetime.fromtimestamp(core.get("reset", 0)).strftime("%H:%M")
+        log(f"WARNING: only {remaining} calls left; quota resets at {reset}", "warn")
+
+
+def gh_download(path, token, dest: Path):
+    """Download to dest. Returns the HTTP status (200 on success)."""
+    status, headers, body = gh(path, token)
+    if status in (301, 302, 303, 307, 308):
+        loc = headers.get("Location")
+        try:
+            with urllib.request.urlopen(loc, timeout=300) as r:  # no auth header on blob URL
+                body, status = r.read(), 200
+        except urllib.error.HTTPError as e:
+            return e.code
+    elif status != 200:
+        return status
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(body)
+    return 200
+
+
+def executed_state(run, jobs):
+    """'yes' if any job step actually ran on a runner, 'no' if none did, 'unknown' if we can't tell.
+
+    Runs held for approval (action_required), skipped runs, and startup failures
+    (e.g. invalid YAML) never execute, so they never produce logs or artifacts.
+    """
+    if run.get("conclusion") in ("action_required", "skipped"):
+        return "no"
+    if jobs is None:
+        return "unknown"
+    for j in jobs.get("jobs", []):
+        for step in j.get("steps") or []:
+            if step.get("conclusion") in ("success", "failure"):
+                return "yes"
+    return "no"
+
+
+_LOG_TS = re.compile(r"^\ufeff?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)Z\s?")
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+UPLOAD_LOG_PATTERNS = {
+    "artifact_id": re.compile(r"Artifact ID (?:is )?(\d+)"),
+    "digest": re.compile(r"SHA256 digest of uploaded artifact zip is ([0-9a-f]{64})"),
+    "size": re.compile(r"Final size is (\d+) bytes"),
+    "no_files": re.compile(r"No files were found with the provided path"),
+    "error": re.compile(r"##\[error\](.*(?:artifact|upload).*)", re.IGNORECASE),
+}
+
+
+def log_lines(zip_path):
+    """Yield (timestamp, text) for every line in a run's logs.zip."""
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            for name in z.namelist():
+                if name.endswith("/"):
+                    continue
+                for raw in z.read(name).decode("utf-8", "replace").splitlines():
+                    m = _LOG_TS.match(raw)
+                    yield (m.group(1).replace("T", " ") if m else ""), _ANSI.sub("", raw[m.end():] if m else raw)
+    except (zipfile.BadZipFile, OSError):
+        return
+
+
+def analyze_upload(zip_path, jobs):
+    """What the run's own records say about its artifact upload."""
+    info = {"step": "", "ids": [], "digest": "", "size": "", "time": "", "no_files": False, "error": ""}
+    concl = []
+    for j in (jobs or {}).get("jobs", []):
+        for st in j.get("steps") or []:
+            if "upload" in (st.get("name") or "").lower():
+                concl.append(st.get("conclusion") or st.get("status") or "?")
+    info["step"] = ";".join(dict.fromkeys(concl))
+    if not zip_path.exists():
+        return info
+    for ts, text in log_lines(zip_path):
+        m = UPLOAD_LOG_PATTERNS["artifact_id"].search(text)
+        if m and m.group(1) not in info["ids"]:
+            info["ids"].append(m.group(1))
+            info["time"] = info["time"] or ts
+        if (m := UPLOAD_LOG_PATTERNS["digest"].search(text)):
+            info["digest"] = m.group(1)
+        if (m := UPLOAD_LOG_PATTERNS["size"].search(text)):
+            info["size"] = m.group(1)
+        if UPLOAD_LOG_PATTERNS["no_files"].search(text):
+            info["no_files"] = True
+        if not info["error"] and (m := UPLOAD_LOG_PATTERNS["error"].search(text)):
+            info["error"] = m.group(1).strip()[:200]
+    return info
+
+
+def artifact_state(repo, token, artifact_id):
+    """Look up one artifact by ID: 'present', 'expired', 'not found', or 'HTTP n'."""
+    status, _, body = gh(f"/repos/{repo}/actions/artifacts/{artifact_id}", token)
+    if status == 200:
+        return "expired" if json.loads(body).get("expired") else "present"
+    return "not found" if status == 404 else f"HTTP {status}"
+
+
+def retention_days(yml):
+    m = re.search(r"upload-artifact[\s\S]{0,600}?retention-days:\s*[\"']?(\d+)", yml or "")
+    return int(m.group(1)) if m else None
+
+
+def audit_log_events(org, repo, token, since):
+    """Query the org audit log for artifact/log deletions. Returns (events, error)."""
+    events = []
+    for action in ("artifact.destroy", "checks.delete_logs"):
+        status, _, body = gh(f"/orgs/{org}/audit-log", token,
+                             {"phrase": f"action:{action} created:>={since}",
+                              "include": "all", "per_page": 100})
+        if status != 200:
+            return None, (f"HTTP {status}: the audit log API needs an org owner token with "
+                          "read:audit_log on GitHub Enterprise Cloud")
+        batch = json.loads(body)
+        if len(batch) >= 100:
+            log(f"    audit log: 100+ {action} events; only the first 100 were read", "warn")
+        events += [e for e in batch if e.get("repo") in (repo, None, "")]
+    return events, ""
+
+
+def artifact_names(yml):
+    """Artifact names the workflow intends to upload (from upload-artifact `name:`)."""
+    names = []
+    for m in re.finditer(r"upload-artifact", yml or ""):
+        n = re.search(r"\bname:\s*[\"']?([^\s\"'#]+)", yml[m.end():m.end() + 400])
+        if n:
+            names.append(n.group(1))
+    return names
+
+
+# --------------------------------------------------------------------------- time
+
+def to_utc(iso):
+    """'2026-10-23T11:04:12-04:00' -> ('2026-10-23 15:04', '-04:00')."""
+    if not iso:
+        return "", ""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return iso, ""
+    off = dt.strftime("%z")
+    off = f"{off[:3]}:{off[3:]}" if off else ""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), off
+
+
+# --------------------------------------------------------------------------- matching
+
+def compile_patterns(pats):
+    return [(p, re.compile(p, re.IGNORECASE)) for p in pats]
+
+
+def match(text, regexes):
+    if not text:
+        return []
+    return [p for p, rx in regexes if rx.search(text)]
+
+
+class Rules:
+    """Strong patterns flag on one hit; weak patterns flag only in combination."""
+
+    def __init__(self, strong, weak, threshold):
+        self.strong = compile_patterns(strong)
+        self.weak = compile_patterns(weak)
+        self.threshold = threshold
+
+    def tier(self, strong_hits, weak_hits):
+        if strong_hits:
+            return "strong"
+        if self.threshold and len(set(weak_hits)) >= self.threshold:
+            return "weak-combo"
+        return ""
+
+    def describe(self):
+        return {"strong": [p for p, _ in self.strong], "weak": [p for p, _ in self.weak],
+                "weak_threshold": self.threshold}
+
+
+# --------------------------------------------------------------------------- git
+
+
+# Authenticated git access for private repos. The token is handed to git through
+# environment-scoped config (GIT_CONFIG_COUNT, git >= 2.31), so it never appears in
+# a process listing, in the mirror's .git/config, or in any evidence file.
+GIT_AUTH_ENV = {}
+
+
+def set_git_auth(token):
+    global GIT_AUTH_ENV
+    GIT_AUTH_ENV = {}
+    if not token:
+        return "anonymous (public repos only)"
+    m = re.search(r"(\d+)\.(\d+)", subprocess.run(["git", "--version"], capture_output=True, text=True).stdout)
+    if not m or (int(m.group(1)), int(m.group(2))) < (2, 31):
+        log("git older than 2.31: cloning without the token, so private repos will be skipped", "warn")
+        return "anonymous (git too old for safe token passing)"
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    GIT_AUTH_ENV = {"GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+                    "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}"}
+    return "with token (private repos the token can read)"
+
+
+def clone_error(stderr):
+    """Short, useful reason from a failed clone/fetch."""
+    last = (stderr or "").strip().splitlines()[-1:] or [""]
+    reason = last[0].replace("fatal: ", "")
+    low = (stderr or "").lower()
+    if "could not read username" in low or "repository not found" in low or "not found" in reason.lower():
+        return ("not found, or not readable with this token (no access to the repo, token expired/"
+                "revoked, or not SSO-authorized; check with ./ghtokenusage)" if GIT_AUTH_ENV
+                else "repository not found, or private (no token: public repos only)")
+    if "authentication failed" in low or "invalid username or token" in low or "401" in low:
+        return "token rejected by git (expired, revoked, or not authorized for this org's SSO)"
+    if "403" in low:
+        return "access denied (403): token lacks Contents: read on this repo, or SSO authorization"
+    return reason[:200]
+
+
+def git(args, cwd=None, check=True):
+    # Never prompt for credentials (a missing/private repo would otherwise hang)
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", **GIT_AUTH_ENV}
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
+                       text=True, errors="replace", env=env)
+    if check and r.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed: {r.stderr.strip()}")
+    return r
+
+
+def mirror_clone(repo, dest: Path):
+    if dest.exists():
+        log(f"  mirror exists, fetching new refs (no prune): {dest}")
+        git(["fetch", "origin", "+refs/*:refs/*"], cwd=dest, check=False)
+    else:
+        log(f"  mirror cloning {repo}")
+        git(["clone", "--mirror", f"https://github.com/{repo}.git", str(dest)])
+    git(["config", "gc.auto", "0"], cwd=dest)
+    git(["config", "gc.pruneExpire", "never"], cwd=dest)
+    git(["config", "core.logAllRefUpdates", "always"], cwd=dest)
+
+
+def fetch_sha(mirror: Path, sha, refname):
+    r = git(["fetch", "origin", f"{sha}:{refname}"], cwd=mirror, check=False)
+    if r.returncode != 0:
+        # Fall back to checking whether we already have it locally
+        have = git(["cat-file", "-e", f"{sha}^{{commit}}"], cwd=mirror, check=False).returncode == 0
+        if have:
+            git(["update-ref", refname, sha], cwd=mirror, check=False)
+            return True
+        log(f"  could not fetch {sha[:12]}: {r.stderr.strip()[:200]}", "warn")
+        return False
+    return True
+
+
+def parse_patch(patch_text):
+    """Return {path: {'+': [lines], '-': [lines]}} from a unified diff."""
+    files, cur = {}, None
+    for line in patch_text.splitlines():
+        if line.startswith("diff --git "):
+            m = re.match(r"diff --git a/(.+?) b/(.+)$", line)
+            cur = m.group(2) if m else line
+            files.setdefault(cur, {"+": [], "-": []})
+        elif cur and line.startswith("+") and not line.startswith("+++"):
+            files[cur]["+"].append(line[1:])
+        elif cur and line.startswith("-") and not line.startswith("---"):
+            files[cur]["-"].append(line[1:])
+    return files
+
+
+def scan_git(mirror: Path, rules, out_tsv: Path):
+    shas = git(["log", "--all", "--format=%H", "--", *WORKFLOW_PATHS], cwd=mirror).stdout.split()
+    log(f"  scanning {len(shas)} commits that touched {WORKFLOW_PATHS}")
+    rows = []
+    last = time.monotonic()
+    for n, sha in enumerate(shas, 1):
+        if time.monotonic() - last > 15:
+            log(f"    ...{n}/{len(shas)} commits scanned")
+            last = time.monotonic()
+        fmt = "%H%x1f%an%x1f%ae%x1f%aI%x1f%cn%x1f%ce%x1f%cI%x1f%P%x1f%s"
+        meta = git(["show", "-s", f"--format={fmt}", sha], cwd=mirror).stdout.strip().split("\x1f")
+        status = {}
+        for ln in git(["show", "--format=", "--name-status", "-m", "--first-parent", sha,
+                       "--", *WORKFLOW_PATHS], cwd=mirror).stdout.splitlines():
+            parts = ln.split("\t")
+            if len(parts) >= 2:
+                status[parts[-1]] = parts[0]
+        patch = git(["show", "--format=", "--no-color", "-U0", "-m", "--first-parent", sha,
+                     "--", *WORKFLOW_PATHS], cwd=mirror).stdout
+        for path, chg in parse_patch(patch).items():
+            def hits(lines, regexes):
+                return sorted({p for l in lines for p in match(l, regexes)})
+            s_add, w_add = hits(chg["+"], rules.strong), hits(chg["+"], rules.weak)
+            s_rm, w_rm = hits(chg["-"], rules.strong), hits(chg["-"], rules.weak)
+            # Evaluate added and removed sides separately so an unrelated edit
+            # can't combine weak hits from old and new lines.
+            tiers = {rules.tier(s_add, w_add), rules.tier(s_rm, w_rm)} - {""}
+            tier = "strong" if "strong" in tiers else ("weak-combo" if tiers else "")
+            rows.append({
+                "commit": meta[0], "file": path, "change": status.get(path, "?"),
+                "flagged": tier,
+                "strong_added": labels(s_add), "weak_added": labels(w_add),
+                "strong_removed": labels(s_rm), "weak_removed": labels(w_rm),
+                "author": f"{meta[1]} <{meta[2]}>", "author_date": meta[3],
+                "committer": f"{meta[4]} <{meta[5]}>", "committer_date": meta[6],
+                "committer_date_utc": to_utc(meta[6])[0], "committer_tz": to_utc(meta[6])[1],
+                "parents": meta[7], "subject": meta[8],
+                "dfir_run_ref": "", "in_refs": "",
+            })
+    # Which refs contain each commit is slow on big mirrors (thousands of PR refs),
+    # so only look it up for flagged commits.
+    flagged = list(dict.fromkeys(r["commit"] for r in rows if r["flagged"]))
+    if flagged:
+        log(f"  finding branches/refs that contain {len(flagged)} flagged commit(s)")
+    refs_of = {}
+    for sha in flagged:
+        refs_of[sha] = git(["for-each-ref", "--contains", sha, "--format=%(refname)"],
+                           cwd=mirror, check=False).stdout.split()
+    for r in rows:
+        refs = refs_of.get(r["commit"], [])
+        r["dfir_run_ref"] = ";".join(x for x in refs if x.startswith("refs/dfir/"))
+        r["in_refs"] = ";".join(x for x in refs if not x.startswith("refs/dfir/"))[:2000]
+    rows.sort(key=lambda r: r["committer_date_utc"])
+    if rows:
+        write_tsv(out_tsv, rows)
+    return rows
+
+
+def scan_refs(mirror: Path, rules):
+    # Strong patterns only: weak ones (curl, base64...) are meaningless in ref names
+    refs = git(["for-each-ref", "--format=%(refname)%09%(objectname)"], cwd=mirror).stdout.splitlines()
+    return [r for r in refs if match(r.split("\t")[0], rules.strong)]
+
+
+# --------------------------------------------------------------------------- API
+
+def parse_bound(value, end=False):
+    """'YYYY-MM-DD' or ISO date-time -> aware UTC datetime. A bare date as an end bound
+    means the end of that day (inclusive)."""
+    v = value.strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+        d = datetime.strptime(v, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return d + timedelta(days=1, seconds=-1) if end else d
+    try:
+        d = datetime.fromisoformat(v.replace("Z", "+00:00"))
+    except ValueError:
+        die(f"can't parse date/time {value!r}; use YYYY-MM-DD or 2026-10-23T14:00:00Z")
+    return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
+def _iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+RUN_CAP = 1000  # GitHub returns at most 1,000 runs per filtered listing
+
+
+def list_runs(repo, token, since, until=None):
+    """Every run created in [since, until]. GitHub caps a filtered listing at 1,000 runs,
+    so a window that hits the cap is split in half (repeatedly) until each piece fits.
+
+    Returns (runs, windows). Each window records GitHub's own total_count next to what
+    was collected; totals are exact below the cap (GitHub's count for large windows is
+    not, e.g. it stops at 2,500), so matching leaf windows prove the list is complete."""
+    start = parse_bound(since)
+    end = parse_bound(until, end=True) if until else datetime.now(timezone.utc)
+    seen, out, gaps, leaves = set(), [], [], []
+    windows = 0
+
+    def fetch(a, b):
+        nonlocal windows
+        windows += 1
+        got, page, total = [], 1, None
+        while True:
+            data = gh_json(f"/repos/{repo}/actions/runs", token,
+                           {"created": f"{_iso(a)}..{_iso(b)}", "per_page": 100, "page": page})
+            if not data:
+                break
+            if total is None:
+                total = data.get("total_count")
+            runs = data.get("workflow_runs", [])
+            got += runs
+            if len(runs) < 100 or len(got) >= RUN_CAP:
+                break
+            page += 1
+        if len(got) >= RUN_CAP:
+            if (b - a).total_seconds() > 1:
+                mid = a + (b - a) / 2
+                log(f"    {len(got)}+ runs in {_iso(a)}..{_iso(b)}: splitting the window to get them all")
+                fetch(a, mid)
+                fetch(mid + timedelta(seconds=1), b)
+                return
+            gaps.append(f"{_iso(a)}..{_iso(b)}")
+        ids = {r["id"] for r in got}
+        status = ("OK" if total == len(ids) else
+                  "DELETED?" if total is not None and total < len(ids) else "SHORT")
+        leaves.append({"window_start_utc": _iso(a), "window_end_utc": _iso(b),
+                       "github_total": "" if total is None else total, "collected": len(ids), "status": status})
+        for r in got:
+            if r["id"] not in seen:
+                seen.add(r["id"])
+                out.append(r)
+
+    fetch(start, end)
+    if windows > 1:
+        log(f"  run listing split into {windows} windows to stay under GitHub's 1,000-run cap")
+    for g in gaps:
+        log(f"  WARNING: more than 1,000 runs within one second ({g}); some may be missing", "warn")
+    out.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+    short = [w for w in leaves if w["status"] == "SHORT"]
+    if short:
+        log(f"  WARNING: {len(short)} window(s) returned fewer runs than GitHub reports; see "
+            "api_runs_windows.tsv and re-run those windows", "warn")
+    return out, leaves
+
+
+def workflow_at_sha(repo, path, sha, token, cache):
+    key = (path, sha)
+    if key in cache:
+        return cache[key]
+    clean = path.split("@")[0]
+    content = None
+    if clean.startswith(".github/"):
+        data = gh_json(f"/repos/{repo}/contents/{urllib.parse.quote(clean)}", token, {"ref": sha})
+        if data and data.get("encoding") == "base64":
+            content = base64.b64decode(data["content"]).decode("utf-8", "replace")
+    cache[key] = content
+    return content
+
+
+def hunt_api(repo, token, since, until, rules, repo_dir: Path, mirror: Path, download):
+    runs_dir = repo_dir / "runs"
+    all_runs, rows, cache = [], [], {}
+    evidence_for_version = {}  # (path, sha) -> run_id holding full evidence
+    listed, leaves = list_runs(repo, token, since, until)
+    all_runs.extend(listed)
+    write_tsv(repo_dir / "api_runs_windows.tsv", leaves,
+              ["window_start_utc", "window_end_utc", "github_total", "collected", "status"])
+    n_ok = sum(1 for w in leaves if w["status"] == "OK")
+    if leaves and n_ok == len(leaves):
+        completeness = f"verified ({len(leaves)} window{'s' if len(leaves) != 1 else ''}, all match GitHub's count)"
+    else:
+        bad = [w for w in leaves if w["status"] != "OK"]
+        completeness = (f"CHECK: {len(bad)} of {len(leaves)} windows differ from GitHub's count "
+                        f"(see api_runs_windows.tsv)")
+    (repo_dir / "api_runs_completeness.txt").write_text(completeness)
+    log(f"  {len(all_runs)} runs since {since}; run list {completeness}",
+        "ok" if completeness.startswith("verified") else "warn")
+    (repo_dir / "api_runs_all.json").write_text(json.dumps(all_runs, indent=2))
+
+    for run in all_runs:
+        rid, sha, path = run["id"], run.get("head_sha"), run.get("path", "")
+        text_fields = " ".join(str(run.get(k) or "") for k in
+                               ("name", "display_title", "path", "head_branch"))
+        text_fields += " " + str((run.get("head_commit") or {}).get("message") or "")
+        yml = workflow_at_sha(repo, path, sha, token, cache) if sha and path else None
+        meta_strong = match(text_fields, rules.strong)
+        yml_strong = match(yml, rules.strong)
+        yml_weak = match(yml, rules.weak)  # weak patterns are judged on YAML only
+        tier = rules.tier(meta_strong + yml_strong, yml_weak)
+        via = "+".join(x for x, hit in (("meta", meta_strong), ("yaml", yml_strong)) if hit)
+
+        # Strong hits: full evidence for EVERY run (each attacker run may exfiltrate
+        # different data). Weak-combo: full evidence once per workflow version.
+        version = (path, sha)
+        full = tier == "strong" or (tier and version not in evidence_for_version)
+        if tier and full:
+            evidence_for_version.setdefault(version, rid)
+        row = {
+            "run_id": rid, "flagged": tier,
+            "evidence_run_id": (rid if full else evidence_for_version.get(version, "")) if tier else "",
+            "matched_via": via,
+            "strong_metadata": labels(meta_strong), "strong_yaml": labels(yml_strong),
+            "weak_yaml": labels(yml_weak),
+            "executed": "", "logs": "", "artifacts": "", "artifact_detail": "",
+            "upload_step": "", "upload_artifact_ids": "", "upload_digest": "",
+            "upload_size_bytes": "", "upload_time_utc": "", "artifact_api_state": "",
+            "expected_artifacts": ";".join(artifact_names(yml)),
+            "created_at": run.get("created_at"), "updated_at": run.get("updated_at"),
+            "event": run.get("event"), "status": run.get("status"),
+            "conclusion": run.get("conclusion"), "name": run.get("name"),
+            "display_title": run.get("display_title"), "path": path,
+            "head_branch": run.get("head_branch"), "head_sha": sha,
+            "actor": (run.get("actor") or {}).get("login"),
+            "triggering_actor": (run.get("triggering_actor") or {}).get("login"),
+            "head_repo": (run.get("head_repository") or {}).get("full_name"),
+            "run_attempt": run.get("run_attempt"), "url": run.get("html_url"),
+            "yaml_retrieved": "yes" if yml is not None else "no",
+        }
+        rows.append(row)
+        if not tier:
+            continue
+
+        where = f"{Path(path).name} @ {(sha or '')[:12]}, branch {row['head_branch']}"
+        if tier == "strong":
+            hits = []
+            if meta_strong:
+                hits.append(f"metadata: {labels(meta_strong)}")
+            if yml_strong:
+                hits.append(f"yaml: {labels(yml_strong)}")
+            log(f"  FLAGGED run {rid} ({where}) by {row['actor']} | {' | '.join(hits)}", "flag")
+        elif full:
+            log(f"  weak-combo run {rid} ({where}) | yaml: {labels(yml_weak)}; "
+                "collecting once for this workflow version", "warn")
+        rd = runs_dir / str(rid)
+        rd.mkdir(parents=True, exist_ok=True)
+        (rd / "run.json").write_text(json.dumps(run, indent=2))
+        if not full:
+            row["logs"] = row["artifacts"] = f"see run {row['evidence_run_id']}"
+            continue  # same weak-combo workflow version already collected
+        if yml is not None:
+            (rd / Path(path.split("@")[0]).name).write_text(yml)
+        if sha:
+            fetch_sha(mirror, sha, f"refs/dfir/runs/{rid}")
+        jobs = gh_json(f"/repos/{repo}/actions/runs/{rid}/jobs", token,
+                       {"filter": "all", "per_page": 100})
+        if jobs:
+            (rd / "jobs.json").write_text(json.dumps(jobs, indent=2))
+        row["executed"] = executed_state(run, jobs)
+        if row["executed"] == "no" and tier == "strong":
+            log(f"    run {rid} never executed (conclusion: {row['conclusion']}); "
+                "no logs or artifacts were ever created", "ok")
+        if not download:
+            row["logs"] = row["artifacts"] = "not collected"
+            continue
+
+        st = gh_download(f"/repos/{repo}/actions/runs/{rid}/logs", token, rd / "logs.zip")
+        if st == 200:
+            row["logs"] = "collected"
+        elif st in (404, 410) and row["executed"] == "no":
+            row["logs"] = "none (never ran)"
+        elif st in (404, 410):
+            row["logs"] = f"GONE ({st})"
+            log(f"    logs for run {rid} are gone ({st}) although it ran: likely deleted", "warn")
+        else:
+            row["logs"] = f"error {st}"
+            log(f"    logs for run {rid}: HTTP {st}", "warn")
+
+        arts = gh_json(f"/repos/{repo}/actions/runs/{rid}/artifacts", token, {"per_page": 100})
+        if arts is None:
+            row["artifacts"] = "error"
+            continue
+        (rd / "artifacts.json").write_text(json.dumps(arts, indent=2))
+        listed = arts.get("artifacts", [])
+        got = expired = failed = 0
+        for a in listed:
+            if a.get("expired"):
+                expired += 1
+                log(f"    artifact {a['name']} expired", "warn")
+                continue
+            safe = re.sub(r"[^\w.-]", "_", a["name"])
+            if gh_download(a["archive_download_url"], token,
+                           rd / "artifacts" / f"{a['id']}_{safe}.zip") == 200:
+                got += 1
+            else:
+                failed += 1
+        up = analyze_upload(rd / "logs.zip", jobs) if row["executed"] != "no" else None
+        if up:
+            row.update({"upload_step": up["step"], "upload_artifact_ids": ";".join(up["ids"]),
+                        "upload_digest": up["digest"], "upload_size_bytes": up["size"],
+                        "upload_time_utc": up["time"]})
+        if listed:
+            parts = [f"{got} collected"] + ([f"{expired} expired"] if expired else []) \
+                + ([f"{failed} failed"] if failed else [])
+            row["artifacts"] = ", ".join(parts)
+        elif row["executed"] == "no":
+            row["artifacts"] = "n/a"
+        elif up and up["ids"]:
+            # The log proves an artifact was uploaded; ask the API about each ID directly.
+            states = {i: artifact_state(repo, token, i) for i in up["ids"]}
+            row["artifact_api_state"] = ";".join(f"{i}={v}" for i, v in states.items())
+            days = retention_days(yml)
+            age = None
+            if up["time"]:
+                age = (datetime.now(timezone.utc)
+                       - datetime.strptime(up["time"][:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)).days
+            if all(v == "not found" for v in states.values()):
+                if days is not None and age is not None and age >= days:
+                    row["artifacts"] = "EXPIRED"
+                    row["artifact_detail"] = (f"uploaded; the workflow set retention-days: {days}, which has passed, "
+                                              "and the API returns 404. Most likely expired; an artifact.destroy "
+                                              "audit event would mean it was deleted first")
+                else:
+                    row["artifacts"] = "DELETED"
+                    row["artifact_detail"] = ("uploaded (log shows artifact ID), now 404 from the API; "
+                                              + (f"retention-days: {days} not yet reached" if days is not None
+                                                 else "default retention not reached"))
+                    log(f"    run {rid}: artifact {', '.join(up['ids'])} was uploaded and is now gone: DELETED",
+                        "flag")
+            elif any(v == "expired" for v in states.values()):
+                row["artifacts"] = "EXPIRED"
+                row["artifact_detail"] = "uploaded, API reports it expired"
+            else:
+                row["artifacts"] = "UNLISTED"
+                row["artifact_detail"] = f"uploaded; API lookup by ID: {row['artifact_api_state']}"
+        elif up and up["no_files"]:
+            row["artifacts"] = "NOT UPLOADED"
+            row["artifact_detail"] = "upload step ran but found no files (an earlier step likely produced nothing)"
+        elif up and up["step"] and all(c in ("skipped", "failure", "cancelled") for c in up["step"].split(";")):
+            row["artifacts"] = "NOT UPLOADED"
+            row["artifact_detail"] = f"upload step did not succeed ({up['step']})" + (
+                f": {up['error']}" if up["error"] else "")
+        elif row["expected_artifacts"]:
+            row["artifacts"] = "MISSING"
+            row["artifact_detail"] = ("expected upload, but " +
+                                      ("logs are gone" if "GONE" in row["logs"] else "no upload record in the logs"))
+            log(f"    run {rid}: expected artifact {row['expected_artifacts']} but found no upload record", "warn")
+        else:
+            row["artifacts"] = "none"
+        if row["artifact_detail"] and row["artifacts"] != "DELETED":
+            log(f"    run {rid}: artifact {row['artifacts']}: {row['artifact_detail']}",
+                "warn" if row["artifacts"] in ("MISSING", "UNLISTED") else "info")
+
+    if rows:
+        write_tsv(repo_dir / "api_runs.tsv", rows)
+    return rows
+
+
+# --------------------------------------------------------------------------- report
+
+def _fit(text, width):
+    text = "" if text is None else str(text)
+    return text if len(text) <= width else text[:max(1, width - 1)] + "…"
+
+
+def table(headers, rows, widths, color, indent="  "):
+    """rows: list of lists of str or (str, style). Returns lines."""
+    def cell(v, w):
+        txt, style = v if isinstance(v, tuple) else (v, "")
+        txt = _fit(txt, w).ljust(w)
+        return paint(txt, style, color) if style else txt
+    out = [(indent + "  ".join(_fit(h, w).ljust(w) for h, w in zip(headers, widths))).rstrip(),
+           indent + "  ".join("─" * w for w in widths)]
+    out[0] = paint(out[0], "head", color)
+    for r in rows:
+        out.append(indent + "  ".join(cell(v, w) for v, w in zip(r, widths)).rstrip())
+    return out
+
+
+def _ts(iso):
+    """Any ISO-8601 time -> 'YYYY-MM-DD HH:MM:SS' in UTC."""
+    if not iso:
+        return ""
+    try:
+        return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return iso.replace("T", " ")[:19]
+
+
+def _ran(v):
+    return {"yes": ("yes", "flag"), "no": ("no", "ok"), "unknown": ("?", "warn")}.get(v, v)
+
+
+def _st(v):
+    if "GONE" in v or v in ("MISSING", "DELETED", "UNLISTED"):
+        return v, "error"
+    if v in ("NOT UPLOADED", "EXPIRED"):
+        return v, "warn"
+    if "never ran" in v or v == "n/a":
+        return v, "dim"
+    if "collected" in v:
+        return v, "ok"
+    return v
+
+
+def _count(values):
+    c = {}
+    for v in values:
+        c[v] = c.get(v, 0) + 1
+    return ", ".join(f"{k} ({n})" for k, n in sorted(c.items(), key=lambda kv: -kv[1])) or "—"
+
+
+def classify(runs):
+    """Group one repo's runs the way the report presents them."""
+    strong = sorted([r for r in runs if r["flagged"] == "strong"], key=lambda r: r["created_at"] or "")
+    weak = sorted([r for r in runs if r["flagged"] == "weak-combo"], key=lambda r: r["created_at"] or "")
+    flagged = strong + weak
+    return {
+        "strong": strong, "weak": weak,
+        "gaps": [r for r in flagged if r["executed"] != "no" and
+                 ("GONE" in r["logs"] or r["artifacts"] in ("DELETED", "MISSING", "UNLISTED"))],
+        "uploads": [r for r in flagged if r["executed"] == "yes" and
+                    (r["expected_artifacts"] or r["upload_artifact_ids"] or r["upload_step"])],
+        "ran_code": [r for r in strong if "yaml" in r["matched_via"] and r["executed"] == "yes"],
+        "never_ran": [r for r in strong if "yaml" in r["matched_via"] and r["executed"] == "no"],
+        "kept": sum(int(m.group(1)) for r in flagged for m in [re.match(r"(\d+) collected", r["artifacts"])] if m),
+        "lost": sum(1 for r in flagged if r["artifacts"] in ("DELETED", "EXPIRED")),
+    }
+
+
+def render_report(meta, repos, color):
+    W = 78
+    L = []
+    rule = paint("═" * W, "head", color)
+    L += [rule, paint(f" GitHub workflow hunt — summary".ljust(W - 22) + f"ghworkflowhunt {__version__}", "head", color), rule]
+
+    def kv(k, v, style=""):
+        L.append(f"  {k:<27}{paint(str(v), style, color) if style else v}")
+
+    kv("Collected (UTC)", meta["collected"])
+    kv("Run window", f"{meta['since']} → {meta['until'] or 'now'}")
+    kv("Strong patterns", labels(meta["patterns"]["strong"]) or "—")
+    wt = meta["patterns"]["weak_threshold"]
+    kv("Weak patterns", (labels(meta["patterns"]["weak"]) + f"  (flag at {wt}+)") if wt
+       else "recorded only (weak-combo flagging off)")
+
+    for repo, why in meta.get("failed", {}).items():
+        kv("SKIPPED (clone failed)", f"{repo}: {why}", "error")
+    groups = {repo: classify(d["runs"]) for repo, d in repos.items()}
+
+    def severity(repo):
+        g, st = groups[repo], repos[repo]["stats"]
+        return (-len(g["ran_code"]), -len(g["gaps"]), -st["runs_flagged_strong"],
+                -st["workflow_commits_flagged_strong"], -len(repos[repo]["refs"]), repo)
+
+    order = sorted(repos, key=severity)  # most serious first
+
+    if len(repos) > 1:
+        hit = [r for r in order if groups[r]["strong"] or groups[r]["weak"]
+               or repos[r]["stats"]["workflow_commits_flagged_strong"] or repos[r]["refs"]]
+        kv("Repos scanned", f"{len(repos)}  ({len(hit)} with findings, {len(repos) - len(hit)} clean)",
+           "flag" if hit else "ok")
+        L += ["", paint("  All repos at a glance (most serious first)", "head", color)]
+
+        def n(v, style):
+            return (str(v), style) if v else ("0", "dim")
+
+        rows = []
+        for r in order:
+            g, st = groups[r], repos[r]["stats"]
+            actors = _count(x["actor"] for x in g["strong"]) if g["strong"] else "—"
+            rows.append([(r, "flag") if g["ran_code"] else r,
+                         n(st["runs_flagged_strong"], "flag"), n(len(g["ran_code"]), "flag"),
+                         n(len(g["never_ran"]), "ok"), n(len(g["gaps"]), "error"),
+                         n(g["kept"], "ok"), n(g["lost"], "warn"),
+                         n(st["workflow_commits_flagged_strong"], "flag"), n(len(repos[r]["refs"]), "flag"),
+                         actors])
+        L += table(["Repo", "Flagged", "Executed", "Never ran", "Gaps", "Art kept", "Art lost",
+                    "Commits", "Refs", "Actors"],
+                   rows, [32, 7, 8, 9, 4, 8, 8, 7, 4, 24], color)
+        L.append(paint("  Flagged = strong-flagged runs. Executed = attacker YAML that actually ran (exfiltration\n"
+                       "  scope). Gaps = runs that ran but are missing logs/artifacts. Art kept = artifacts\n"
+                       "  collected; Art lost = DELETED or EXPIRED. Commits = flagged workflow file changes.\n"
+                       "  Refs = suspicious branch/tag names. Details per repo follow, in this order.",
+                       "dim", color))
+
+    for repo in order:
+        d = repos[repo]
+        s, runs, commits, refs = d["stats"], d["runs"], d["commits"], d["refs"]
+        L += ["", paint(f"── {repo} " + "─" * max(3, W - len(repo) - 4), "head", color)]
+        g = groups[repo]
+        strong_runs, weak_runs = g["strong"], g["weak"]
+        flagged_commits = [c for c in commits if c["flagged"]]
+        gaps, uploads, ran_code, never_ran = g["gaps"], g["uploads"], g["ran_code"], g["never_ran"]
+
+        kv("Runs in window", s["runs_total"])
+        if s.get("runs_complete"):
+            kv("Run list", s["runs_complete"], "ok" if s["runs_complete"].startswith("verified") else "error")
+        kv("Flagged runs (strong)", s["runs_flagged_strong"], "flag" if s["runs_flagged_strong"] else "ok")
+        kv("Flagged runs (weak-combo)", s["runs_flagged_weak_combo"], "warn" if s["runs_flagged_weak_combo"] else "")
+        kv("Attacker code executed", f"{len(ran_code)} runs" if ran_code else "0",
+           "flag" if ran_code else "ok")
+        kv("Attacker code never ran", f"{len(never_ran)} runs (held for approval, skipped, or failed to start)"
+           if never_ran else "0", "ok" if never_ran else "")
+        kv("Runs missing evidence", len(gaps), "error" if gaps else "ok")
+        kv("YAML not retrievable", s["runs_yaml_missing"], "warn" if s["runs_yaml_missing"] else "")
+        kv("Workflow commits", f"{s['workflow_commit_count']} ({s['workflow_commits']} file changes)")
+        kv("Flagged file changes", f"{s['workflow_commits_flagged_strong']} strong, "
+           f"{s['workflow_commits_flagged_weak_combo']} weak-combo",
+           "flag" if s["workflow_commits_flagged_strong"] else "")
+        kv("Suspicious refs", len(refs) if refs else
+           ("0  (attacker branches were likely deleted)" if strong_runs else "0"),
+           "flag" if refs else "")
+        if strong_runs:
+            kv("Actors on flagged runs", _count(r["actor"] for r in strong_runs))
+            kv("Events on flagged runs", _count(r["event"] for r in strong_runs))
+            kv("Attacker workflow files", _count(Path(r["path"]).name for r in strong_runs if "yaml" in r["matched_via"]))
+
+        for title, rs in (("Strong-flagged runs", strong_runs), ("Weak-combo runs", weak_runs)):
+            if not rs:
+                continue
+            L += ["", paint(f"  {title} ({len(rs)}, oldest first)", "head", color)]
+            L += table(
+                ["Run ID", "Created (UTC)", "Event", "Branch", "Workflow", "Via", "Ran", "Result", "Logs", "Artifacts"],
+                [[str(r["run_id"]), _ts(r["created_at"]), r["event"], r["head_branch"],
+                  Path(r["path"] or "").name, r["matched_via"], _ran(r["executed"]),
+                  r["conclusion"] or r["status"], _st(r["logs"]), _st(r["artifacts"])] for r in rs],
+                [11, 19, 17, 14, 19, 9, 3, 15, 16, 12], color)
+            L.append(paint("  Via: meta = matched branch/title/commit message; yaml = matched the workflow file.\n"
+                           "  Ran: whether any job step executed on a runner (from the run's job details).", "dim", color))
+
+        if ran_code:
+            L += ["", paint(f"  Attacker code that executed ({len(ran_code)})", "flag", color)]
+            L += table(["Run ID", "Created (UTC)", "Workflow", "Branch", "Result", "Logs", "Artifacts"],
+                       [[str(r["run_id"]), _ts(r["created_at"]), Path(r["path"]).name, r["head_branch"],
+                         r["conclusion"], _st(r["logs"]), _st(r["artifacts"])] for r in ran_code],
+                       [11, 19, 22, 14, 10, 16, 12], color)
+            L.append(paint("  These runs define the exfiltration scope. Review their logs and artifacts first.", "dim", color))
+
+        if never_ran:
+            L += ["", paint(f"  Attacker workflows that never executed ({len(never_ran)})", "ok", color)]
+            for r in never_ran:
+                L.append(f"  {paint('○', 'ok', color)} {r['run_id']}  {_ts(r['created_at'])}  "
+                         f"{Path(r['path']).name:<20} {r['conclusion']}")
+            L.append(paint("  No job ran, so no logs or artifacts were ever created and nothing was exfiltrated by\n"
+                           "  these runs. Confirm no one approved them later: re-run this script, or check the audit log.",
+                           "dim", color))
+
+        if uploads:
+            L += ["", paint(f"  Artifact upload checks ({len(uploads)}, from each run's logs + API lookup by ID)",
+                            "head", color)]
+            L += table(["Run ID", "Workflow", "Upload step", "Artifact ID", "Bytes", "Uploaded (UTC)", "Status"],
+                       [[str(r["run_id"]), Path(r["path"]).name, r["upload_step"] or "—",
+                         r["upload_artifact_ids"] or "—", r["upload_size_bytes"] or "—",
+                         r["upload_time_utc"][:19] or "—", _st(r["artifacts"])] for r in uploads],
+                       [11, 19, 11, 12, 9, 19, 12], color)
+            for r in uploads:
+                if r["artifact_detail"]:
+                    L.append(f"    {r['run_id']}: {r['artifact_detail']}")
+                if r["upload_digest"]:
+                    L.append(paint(f"    {r['run_id']}: SHA-256 from log {r['upload_digest']}", "dim", color))
+            L.append(paint("  DELETED = the log shows an artifact ID, and the API now returns 404 for it before its\n"
+                           "  retention ran out. EXPIRED = uploaded, but past its retention (check retention-days in\n"
+                           "  the YAML; a short value is a way to make evidence vanish). NOT UPLOADED = the run's own\n"
+                           "  logs show no artifact was created.",
+                           "dim", color))
+
+        if gaps:
+            L += ["", paint(f"  Evidence gaps ({len(gaps)})", "error", color)]
+            for r in gaps:
+                what = []
+                if "GONE" in r["logs"]:
+                    what.append(f"logs {r['logs']}")
+                if r["artifacts"] in ("DELETED", "MISSING", "UNLISTED"):
+                    ids = f" ID {r['upload_artifact_ids']}" if r["upload_artifact_ids"] else ""
+                    what.append(f"artifact {r['artifacts']}{ids} (expected: {r['expected_artifacts'] or '?'})")
+                L.append(f"  {paint('✗', 'error', color)} {r['run_id']}  {_ts(r['created_at'])}  "
+                         f"{Path(r['path']).name}  —  {'; '.join(what)}")
+            L.append(paint("  These runs executed, but evidence is missing. Deleting logs or artifacts needs write\n"
+                           "  access. Look for the matching artifact.destroy / checks.delete_logs audit log events.",
+                           "dim", color))
+
+        aud = d.get("audit")
+        if aud is not None:
+            ev, err = aud
+            L += ["", paint("  Audit log: artifact and log deletions", "head", color)]
+            if err:
+                L.append(paint(f"  Not available ({err}).", "warn", color))
+            elif not ev:
+                L.append("  No artifact.destroy or checks.delete_logs events for this repo in the window.")
+            else:
+                ids = {i for r in runs for i in r["upload_artifact_ids"].split(";") if i}
+                rows_ = []
+                for e in sorted(ev, key=lambda e: e.get("@timestamp") or e.get("created_at") or 0):
+                    t = e.get("@timestamp") or e.get("created_at")
+                    t = datetime.fromtimestamp(t / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M:%S") \
+                        if isinstance(t, (int, float)) else str(t)
+                    hit = sorted(i for i in ids if i in json.dumps(e))
+                    rows_.append([t, e.get("action", ""), e.get("actor", ""),
+                                  (", ".join(hit), "flag") if hit else "—"])
+                L += table(["Time (UTC)", "Action", "Actor", "Matches artifact ID"], rows_, [19, 20, 18, 20], color)
+                L.append(paint("  Raw events are saved in audit_log_events.json.", "dim", color))
+
+        if aud is None and gaps:
+            L.append(paint("  Deletion events not checked. Re-run with --audit-log and an org owner token, or search\n"
+                           "  the org audit log for action:artifact.destroy and action:checks.delete_logs.",
+                           "dim", color))
+
+        if flagged_commits:
+            fc = sorted(flagged_commits, key=lambda c: c["committer_date_utc"])
+            L += ["", paint(f"  Flagged workflow file changes ({len(fc)}, oldest first)", "head", color)]
+            L += table(
+                ["Committed (UTC)", "Commit", "Chg", "File", "Author", "Matched"],
+                [[c["committer_date_utc"], c["commit"][:12], c["change"],
+                  c["file"].replace(".github/workflows/", ""), c["author"].split(" <")[0],
+                  "; ".join(x for x in (c["strong_added"] and f"+ {c['strong_added']}",
+                                        c["strong_removed"] and f"- {c['strong_removed']}",
+                                        not (c["strong_added"] or c["strong_removed"]) and f"weak: {c['weak_added'] or c['weak_removed']}") if x)]
+                 for c in fc],
+                [19, 12, 3, 22, 14, 40], color)
+            L.append(paint("  Chg: A = added (new file), M = modified, D = deleted, R = renamed.", "dim", color))
+            offs = {}
+            for c in fc:
+                key = (c["committer_tz"] or "?", c["author"].split(" <")[0])
+                offs[key] = offs.get(key, 0) + 1
+            L.append("  Original commit time zones: " + ", ".join(
+                f"{tz} x{n} ({who})" for (tz, who), n in sorted(offs.items(), key=lambda kv: -kv[1])))
+            L.append(paint("  All times in this report are UTC. The original offset is recorded by the machine that\n"
+                           "  made the commit; different offsets or name formats for one person can mean different\n"
+                           "  machines, or commits made through the GitHub web/API. Commit dates can be forged, so\n"
+                           "  build the timeline from run times (ghimpact writes impact_timeline.tsv).", "dim", color))
+
+        if refs:
+            L += ["", paint(f"  Suspicious refs ({len(refs)})", "flag", color)]
+            L += [f"    {r.replace(chr(9), '  ')}" for r in refs]
+
+        L += ["", paint("  Files", "head", color)]
+        for f in d["files"]:
+            L.append(f"    {f}")
+    L += ["", rule]
+    return "\n".join(L) + "\n"
+
+
+# --------------------------------------------------------------------------- verify-only
+
+EXACT_BELOW = 1000  # GitHub's total_count is only trusted for windows smaller than this
+
+
+def count_windows(repo, token, times, start, end):
+    """Compare GitHub's total_count with the collected runs, window by window, splitting any
+    window whose GitHub total is too large to be exact. One small API call per window."""
+    leaves = []
+
+    def check(a, b):
+        d = gh_json(f"/repos/{repo}/actions/runs", token,
+                    {"created": f"{_iso(a)}..{_iso(b)}", "per_page": 1})
+        total = d.get("total_count") if d else None
+        if total is None:
+            leaves.append({"window_start_utc": _iso(a), "window_end_utc": _iso(b), "github_total": "",
+                           "collected": "", "status": "ERROR"})
+            return
+        if total >= EXACT_BELOW and (b - a).total_seconds() > 1:
+            mid = a + (b - a) / 2
+            check(a, mid)
+            check(mid + timedelta(seconds=1), b)
+            return
+        mine = sum(1 for t in times if a <= t <= b)
+        status = "OK" if total == mine else ("SHORT" if total > mine else "DELETED?")
+        leaves.append({"window_start_utc": _iso(a), "window_end_utc": _iso(b), "github_total": total,
+                       "collected": mine, "status": status})
+
+    check(start, end)
+    return leaves
+
+
+def run_window_from_summaries(out: Path, repo):
+    """(since, until, collected_utc) recorded by the newest earlier run that covered this repo."""
+    for f in sorted(out.glob("summary_*.json"), reverse=True):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if repo in d.get("repos", {}):
+            return d.get("since"), d.get("until"), d.get("collected_utc")
+    return None, None, None
+
+
+def verify_only(a, token):
+    out = Path(a.out)
+    if not out.is_dir():
+        die(f"--verify-only: evidence folder {out} not found")
+    repos = a.repos or sorted(d.name.replace("__", "/", 1) for d in out.iterdir()
+                              if (d / "api_runs_all.json").exists())
+    if not repos:
+        die(f"--verify-only: no api_runs_all.json files under {out}")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    results, all_rows = [], []
+    for repo in repos:
+        f = out / repo.replace("/", "__") / "api_runs_all.json"
+        if not f.exists():
+            results.append({"repo": repo, "status": "NO DATA", "detail": f"{f} not found"})
+            continue
+        runs = json.loads(f.read_text())
+        times = [parse_bound(r["created_at"]) for r in runs if r.get("created_at")]
+        ids = [r["id"] for r in runs]
+        s_since, s_until, s_coll = run_window_from_summaries(out, repo)
+        since = a.since or s_since
+        if not since:
+            results.append({"repo": repo, "status": "NO WINDOW",
+                            "detail": "no summary_*.json for this repo; pass --since (and --until) as used originally"})
+            continue
+        start = parse_bound(since)
+        until = a.until or s_until
+        # No --until in the original run: the listing ended when it ran, after the newest run it saw.
+        end = (parse_bound(until, end=True) if until else
+               max(times) if times else
+               datetime.strptime(s_coll, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc) if s_coll
+               else datetime.now(timezone.utc))
+        log(f"== {repo}: checking {len(runs)} collected runs, {_hms(_iso(start))} → {_hms(_iso(end))} UTC", "head")
+        leaves = count_windows(repo, token, times, start, end)
+        for w in leaves:
+            all_rows.append({"repo": repo, **w})
+        bad = [w for w in leaves if w["status"] != "OK"]
+        gh_sum = sum(w["github_total"] for w in leaves if isinstance(w["github_total"], int))
+        dupes = len(ids) - len(set(ids))
+        outside = sum(1 for t in times if not (start <= t <= end))
+        status = ("VERIFIED" if not bad and not dupes else
+                  "SHORT" if any(w["status"] == "SHORT" for w in bad) else
+                  "ERROR" if any(w["status"] == "ERROR" for w in bad) else
+                  "DELETED?" if bad else "DUPLICATES")
+        results.append({"repo": repo, "status": status, "collected": len(runs), "github": gh_sum,
+                        "windows": len(leaves), "bad": bad, "dupes": dupes, "outside": outside,
+                        "window": f"{_hms(_iso(start))} → {_hms(_iso(end))}",
+                        "source": "command line" if a.since else "original run's summary"})
+        log(f"   {status}: {len(runs)} collected, GitHub counts {gh_sum} in {len(leaves)} window(s)",
+            "ok" if status == "VERIFIED" else "error")
+
+    write_tsv(out / f"verify_runs_{stamp}.tsv", all_rows,
+              ["repo", "window_start_utc", "window_end_utc", "github_total", "collected", "status"])
+    plain = render_verify(results, stamp, out, False)
+    for name in (f"verify_runs_{stamp}.txt", "verify_runs.txt"):
+        (out / name).write_text(plain, encoding="utf-8")
+    try:
+        sys.stdout.write(render_verify(results, stamp, out, USE_COLOR_OUT))
+    except UnicodeEncodeError:
+        sys.stdout.write(plain.encode("ascii", "replace").decode())
+    log(f"report saved to {out / 'verify_runs.txt'}; per-window detail in verify_runs_{stamp}.tsv", "ok")
+    sys.exit(0 if all(r["status"] == "VERIFIED" for r in results) else 1)
+
+
+def _hms(iso_z):
+    return iso_z.replace("T", " ").rstrip("Z")
+
+
+def render_verify(results, stamp, out, color):
+    W = 78
+    L, rule = [], paint("═" * W, "head", color)
+    L += [rule, paint(" Run list verification".ljust(W - 22) + f"ghworkflowhunt {__version__}", "head", color), rule]
+    ok = sum(1 for r in results if r["status"] == "VERIFIED")
+    L.append(f"  {'Checked (UTC)':<24}{datetime.strptime(stamp, '%Y%m%dT%H%M%SZ').strftime('%Y-%m-%d %H:%M:%S')}")
+    L.append(f"  {'Evidence':<24}{out}")
+    L.append(f"  {'Repos':<24}" + paint(f"{len(results)}  ({ok} verified, {len(results) - ok} need attention)",
+                                         "ok" if ok == len(results) else "error", color))
+    order = sorted(results, key=lambda r: (r["status"] == "VERIFIED", r["repo"]))
+    style = {"VERIFIED": "ok", "DELETED?": "warn"}
+    L += [""] + table(["Repo", "Status", "Collected", "GitHub", "Windows", "Run window (UTC)"],
+                      [[r["repo"], (r["status"], style.get(r["status"], "error")), r.get("collected", "—"),
+                        r.get("github", "—"), r.get("windows", "—"), r.get("window", r.get("detail", ""))]
+                       for r in order], [30, 10, 9, 7, 7, 41], color)
+    L.append(paint("  Run window = the original run's --since up to its --until, or up to the newest run it\n"
+                   "  collected when no --until was given.", "dim", color))
+    for r in order:
+        if r["status"] in ("VERIFIED",) or "bad" not in r:
+            continue
+        L += ["", paint(f"── {r['repo']}", "head", color)]
+        for w in r["bad"]:
+            L.append(f"  {w['status']:<9} {_hms(w['window_start_utc'])} → {_hms(w['window_end_utc'])}   "
+                     f"GitHub {w['github_total']}, collected {w['collected']}")
+        if r["dupes"]:
+            L.append(f"  {r['dupes']} duplicate run ID(s) in api_runs_all.json")
+        if any(w["status"] == "SHORT" for w in r["bad"]):
+            w = next(w for w in r["bad"] if w["status"] == "SHORT")
+            L.append(paint(f"  Re-collect, e.g.: ghworkflowhunt {r['repo']} --since {w['window_start_utc']} "
+                           f"--until {w['window_end_utc']} --out <new folder>\n"
+                           "  (one per SHORT window), or re-run the whole repo into the same --out.", "dim", color))
+    L += ["", paint("  VERIFIED = every window's count from GitHub equals the runs collected. SHORT = GitHub has\n"
+                    "  more runs than were collected (re-collect). DELETED? = fewer on GitHub now than collected:\n"
+                    "  runs were deleted after collection (worth noting; the collected copies are evidence).\n"
+                    "  The run window comes from the original run's summary unless --since/--until are given.",
+                    "dim", color), "", rule]
+    return "\n".join(L) + "\n"
+
+
+# --------------------------------------------------------------------------- manifest
+
+def write_manifest(root: Path, skip_dir: Path):
+    lines = []
+    for p in sorted(root.rglob("*")):
+        if p.is_file() and skip_dir not in p.parents and p.name != "manifest.sha256":
+            h = hashlib.sha256(p.read_bytes()).hexdigest()
+            lines.append(f"{h}  {p.relative_to(root)}")
+    (root / "manifest.sha256").write_text("\n".join(lines) + "\n")
+
+
+# --------------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("repos", nargs="*",
+                    help="owner/repo (several, a quoted space/comma-separated list, or GitHub URLs); "
+                         "with --verify-only, defaults to every repo in --out")
+    ap.add_argument("--verify-only", action="store_true",
+                    help="don't collect anything: check that the run lists already in --out are complete "
+                         "(one small API call per time window)")
+    ap.add_argument("--since", default=None,
+                    help="runs created on/after this UTC date or time (YYYY-MM-DD or 2026-10-23T14:00:00Z)")
+    ap.add_argument("--until", help="runs created on/before this UTC date or time (a bare date includes that whole day)")
+    ap.add_argument("--out", default="evidence")
+    ap.add_argument("--pattern", action="append", default=[],
+                    help="add a STRONG regex (flags on one hit); repeatable")
+    ap.add_argument("--weak-pattern", action="append", default=[],
+                    help="add a WEAK regex (flags only in combination); repeatable")
+    ap.add_argument("--weak-threshold", type=int, default=WEAK_THRESHOLD, metavar="N",
+                    help=f"distinct weak patterns needed to flag (default {WEAK_THRESHOLD}; 0 = never)")
+    ap.add_argument("--only-patterns", action="store_true",
+                    help="drop built-in patterns; use only --pattern / --weak-pattern")
+    ap.add_argument("--no-api", action="store_true", help="git history only")
+    ap.add_argument("--no-color", action="store_true", help="disable colored output")
+    ap.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
+    ap.add_argument("--no-download", action="store_true", help="skip logs/artifact downloads")
+    ap.add_argument("--audit-log", action="store_true",
+                    help="also query the org audit log for artifact/log deletions "
+                         "(needs an org owner token; set AUDIT_LOG_TOKEN at the top)")
+    a = ap.parse_args()
+    a.repos = normalize_repos(a.repos)
+    if not a.repos and not a.verify_only:
+        ap.error("give at least one owner/repo (or use --verify-only on an existing --out folder)")
+    global USE_COLOR, USE_COLOR_OUT
+    if a.no_color:
+        USE_COLOR = USE_COLOR_OUT = False
+
+    token = (GITHUB_TOKEN.strip() or os.environ.get("GITHUB_TOKEN")
+             or os.environ.get("GH_TOKEN") or "").strip()
+    if not a.no_api:
+        if not token:
+            die("No token found. Set GITHUB_TOKEN at the top of the script "
+                     "(or in your environment), or run with --no-api for git history only.")
+        validate_token(token)
+    if a.verify_only:
+        if a.no_api:
+            die("--verify-only needs the API (drop --no-api)")
+        verify_only(a, token)
+    if not a.since:
+        a.since = "2026-01-01"
+    log(f"git access: {set_git_auth(token)}")
+    if a.only_patterns:
+        rules = Rules(a.pattern, a.weak_pattern, a.weak_threshold)
+    else:
+        rules = Rules(STRONG_PATTERNS + a.pattern, WEAK_PATTERNS + a.weak_pattern, a.weak_threshold)
+    if not rules.strong and not (rules.weak and rules.threshold):
+        die("No patterns can flag anything. Add --pattern, or --weak-pattern with a threshold above 0.")
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    summary = {"collected_utc": stamp, "since": a.since, "until": a.until,
+               "patterns": rules.describe(), "repos": {}}
+    report_repos, failed = {}, {}
+    log(f"{len(a.repos)} repo(s): {', '.join(a.repos)}")
+
+    for repo in a.repos:
+        log(f"== {repo}", "head")
+        repo_dir = out / repo.replace("/", "__")
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        mirror = repo_dir / "mirror.git"
+        try:
+            mirror_clone(repo, mirror)
+        except RuntimeError as e:
+            reason = clone_error(str(e))
+            log(f"  SKIPPED: could not clone {repo}: {reason}", "error")
+            failed[repo] = reason
+            summary["repos"][repo] = {"error": reason}
+            continue
+
+        api_rows = []
+        if not a.no_api:
+            api_rows = hunt_api(repo, token, a.since, a.until, rules, repo_dir, mirror,
+                                not a.no_download)
+        git_rows = scan_git(mirror, rules, repo_dir / "git_workflow_commits.tsv")
+        bad_refs = scan_refs(mirror, rules)
+        (repo_dir / "suspicious_refs.txt").write_text("\n".join(bad_refs) + ("\n" if bad_refs else ""))
+
+        # Bundle the mirror so the preserved repo is a single hashable file
+        git(["bundle", "create", str(repo_dir / f"{repo.replace('/', '__')}_{stamp}.bundle"),
+             "--all"], cwd=mirror, check=False)
+        write_manifest(repo_dir, mirror)
+
+        s = {
+            "runs_total": len(api_rows),
+            "runs_complete": ((repo_dir / "api_runs_completeness.txt").read_text()
+                              if (repo_dir / "api_runs_completeness.txt").exists() else ""),
+            "runs_flagged_strong": sum(1 for r in api_rows if r["flagged"] == "strong"),
+            "runs_flagged_weak_combo": sum(1 for r in api_rows if r["flagged"] == "weak-combo"),
+            "runs_yaml_missing": sum(1 for r in api_rows if r["yaml_retrieved"] == "no"),
+            "workflow_commit_count": len({r["commit"] for r in git_rows}),
+            "workflow_commits": len(git_rows),
+            "workflow_commits_flagged_strong": sum(1 for r in git_rows if r["flagged"] == "strong"),
+            "workflow_commits_flagged_weak_combo": sum(1 for r in git_rows if r["flagged"] == "weak-combo"),
+            "suspicious_refs": bad_refs,
+        }
+        summary["repos"][repo] = s
+        files = [f"{repo_dir}/{n}" for n in ("api_runs.tsv", "git_workflow_commits.tsv",
+                                             "suspicious_refs.txt", "manifest.sha256")
+                 if (repo_dir / n).exists()]
+        if (repo_dir / "runs").exists():
+            files.append(f"{repo_dir}/runs/  (per-run evidence)")
+        audit = None
+        if a.audit_log and not a.no_api:
+            atok = AUDIT_LOG_TOKEN.strip() or token
+            log("  querying org audit log for artifact.destroy / checks.delete_logs")
+            ev, err = audit_log_events(repo.split("/")[0], repo, atok, a.since)
+            if err:
+                log(f"  audit log not available: {err}", "warn")
+            else:
+                (repo_dir / "audit_log_events.json").write_text(json.dumps(ev, indent=2))
+                write_manifest(repo_dir, mirror)  # include the audit log file in the hashes
+                log(f"  audit log: {len(ev)} deletion events", "flag" if ev else "ok")
+            audit = (ev or [], err)
+        report_repos[repo] = {"stats": s, "runs": api_rows, "commits": git_rows,
+                              "refs": bad_refs, "files": files, "audit": audit}
+        log(f"  done: {s['runs_flagged_strong']} strong / {s['runs_flagged_weak_combo']} weak-combo "
+            f"flagged runs of {s['runs_total']}", "flag" if s["runs_flagged_strong"] else "ok")
+
+    (out / f"summary_{stamp}.json").write_text(json.dumps(summary, indent=2))
+    meta = {"collected": datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").strftime("%Y-%m-%d %H:%M:%S"),
+            "since": a.since, "until": a.until, "patterns": rules.describe(), "failed": failed}
+    plain = render_report(meta, report_repos, color=False)
+    for name in (f"summary_{stamp}.txt", "summary.txt"):
+        (out / name).write_text(plain, encoding="utf-8")
+    try:
+        sys.stdout.write(render_report(meta, report_repos, color=USE_COLOR_OUT))
+    except UnicodeEncodeError:  # legacy Windows console code pages
+        sys.stdout.write(plain.encode("ascii", "replace").decode())
+    log(f"Report saved to {out / 'summary.txt'} (and summary_{stamp}.txt); "
+        f"machine-readable copy in summary_{stamp}.json", "ok")
+
+
+if __name__ == "__main__":
+    main()

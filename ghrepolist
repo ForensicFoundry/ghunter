@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""
+ghrepolist - list a GitHub user's or organization's repositories.
+
+Shows each repo with its last push time, language, fork/archived status and
+size, newest push first, so you can see at a glance which repos were active
+during an incident window.
+
+Use -s/--set to get a shell line that sets REPOS to the list. A script can't
+change variables in the shell that started it, so run it through eval:
+
+  eval "$(ghrepolist foobarbaz -s)"            # sets REPOS=(...) in your shell
+  eval "$(ghrepolist foobarbaz -s --pushed-since 2026-10-22 --no-forks)"
+  ghworkflowhunt "${REPOS[@]}" --since 2026-10-22
+
+The REPOS=(...) array form works in both bash and zsh. Use --var NAME to set a
+different variable.
+
+By default only public repos are listed. With a token that can read the
+account's private repos:
+  ghrepolist foobarbaz --private             private (and internal) repos only
+  ghrepolist foobarbaz --all                 public + private + internal
+  eval "$(ghrepolist foobarbaz -s --all --pushed-since 2026-10-22)"
+
+Other examples:
+  ghrepolist foobarbaz                       table, newest push first
+  ghrepolist foobarbaz --pushed-since 2026-10-22 --no-archived
+  ghrepolist foobarbaz -t repos.tsv          also save a TSV
+  ghrepolist foobarbaz --names               just owner/name, one per line
+
+A token is optional for public repos (it avoids the 60-requests/hour anonymous
+limit) and required for --private/--all, which list only what the token can see.
+It is read like ghtokenusage: ghworkflowhunt next to this script, then
+$GITHUB_TOKEN / $GH_TOKEN.
+Color is used only on a terminal; NO_COLOR=1 or --no-color disables it.
+
+Requires: Python 3.8+. No third-party packages.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+__version__ = "26.09.01"
+
+if os.name == "nt":
+    os.system("")
+
+
+def _color_enabled(stream):
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return hasattr(stream, "isatty") and stream.isatty() and os.environ.get("TERM") != "dumb"
+
+
+USE_COLOR = _color_enabled(sys.stdout)
+USE_COLOR_ERR = _color_enabled(sys.stderr)
+_STYLES = {"ok": "32", "warn": "33", "error": "1;31", "flag": "1;35", "head": "1;36", "dim": "2", "bold": "1"}
+
+
+def paint(text, style, enabled=None):
+    code = _STYLES.get(style, style)
+    on = USE_COLOR if enabled is None else enabled
+    return f"\033[{code}m{text}\033[0m" if on and code else text
+
+
+def note(msg, style="dim"):
+    print(paint(msg, style, USE_COLOR_ERR), file=sys.stderr)
+
+
+def die(msg):
+    print(paint(f"ghrepolist: {msg}", "error", USE_COLOR_ERR), file=sys.stderr)
+    sys.exit(1)
+
+
+TOKEN_LINE = re.compile(r"""^GITHUB_TOKEN\s*=\s*["']([^"']*)["']""", re.MULTILINE)
+
+
+def find_token():
+    here = Path(__file__).resolve().parent
+    for name in ("ghworkflowhunt", "gh_workflow_hunt.py"):
+        p = here / name
+        if p.is_file():
+            m = TOKEN_LINE.search(p.read_text(encoding="utf-8", errors="replace"))
+            if m and m.group(1).strip():
+                return m.group(1).strip(), name
+    for var in ("GITHUB_TOKEN", "GH_TOKEN"):
+        if os.environ.get(var, "").strip():
+            return os.environ[var].strip(), f"${var}"
+    return "", ""
+
+
+def get(url, token):
+    headers = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
+               "User-Agent": f"ghrepolist/{__version__}"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as r:
+            return json.loads(r.read()), r.headers
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            die(f"no GitHub user or organization named {url.split('/')[4]!r}")
+        if e.code == 401:
+            die("GitHub rejected the token (401). Fix it, or unset it to list anonymously.")
+        if e.code in (403, 429) and e.headers.get("X-RateLimit-Remaining") == "0":
+            reset = datetime.fromtimestamp(int(e.headers.get("X-RateLimit-Reset", "0"))).strftime("%H:%M")
+            die(f"API rate limit reached; it resets at {reset}." + ("" if token else " A token raises the limit."))
+        die(f"GitHub returned HTTP {e.code}")
+    except urllib.error.URLError as e:
+        die(f"can't reach api.github.com: {e.reason}")
+
+
+def visibility(r):
+    return r.get("visibility") or ("private" if r.get("private") else "public")
+
+
+def list_repos(account, token, scope):
+    """scope: 'public' | 'private' (private + internal) | 'all'. Returns (kind, repos, note)."""
+    info, _ = get(f"https://api.github.com/users/{urllib.parse.quote(account)}", token)
+    kind, note_ = info.get("type", "User"), ""
+    if kind == "Organization":
+        base = f"https://api.github.com/orgs/{account}/repos?type={'public' if scope == 'public' else 'all'}"
+    else:
+        me = get("https://api.github.com/user", token)[0].get("login", "") if token and scope != "public" else ""
+        if scope != "public" and me.lower() == account.lower():
+            base = "https://api.github.com/user/repos?affiliation=owner&visibility=all"
+        else:
+            base = f"https://api.github.com/users/{account}/repos?type=owner"
+            if scope != "public":
+                note_ = (f"{account} is a user account other than the token's ({me or 'no token'}); "
+                         "GitHub only shows another user's public repos")
+    repos, url = [], base + "&per_page=100&sort=pushed"
+    while url:
+        page, headers = get(url, token)
+        repos += page
+        m = re.search(r'<([^>]+)>;\s*rel="next"', headers.get("Link", "") or "")
+        url = m.group(1) if m else None
+    if scope == "public":
+        repos = [r for r in repos if visibility(r) == "public"]
+    elif scope == "private":
+        repos = [r for r in repos if visibility(r) != "public"]
+    return info, kind, repos, note_
+
+
+def ago(dt):
+    s = (datetime.now(timezone.utc) - dt).total_seconds()
+    for unit, n in (("y", 31536000), ("mo", 2592000), ("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= n:
+            return f"{int(s // n)}{unit} ago"
+    return "just now"
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="ghrepolist", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("account", help="GitHub user or organization name (e.g. foobarbaz)")
+    ap.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
+    ap.add_argument("-s", "--set", action="store_true",
+                    help='print a REPOS=(...) line for eval: eval "$(ghrepolist ACCOUNT -s)"')
+    ap.add_argument("--var", default="REPOS", metavar="NAME", help="variable name for --set (default: REPOS)")
+    vis = ap.add_mutually_exclusive_group()
+    vis.add_argument("--private", action="store_true",
+                     help="list private and internal repos instead of public ones (needs a token that can read them)")
+    vis.add_argument("--all", action="store_true",
+                     help="list public, private and internal repos (private ones need a token)")
+    ap.add_argument("--pushed-since", metavar="YYYY-MM-DD", help="only repos pushed to on or after this date (UTC)")
+    ap.add_argument("--no-forks", action="store_true", help="leave out forks")
+    ap.add_argument("--no-archived", action="store_true", help="leave out archived repos")
+    ap.add_argument("-t", "--tsv", metavar="FILE", help="also write the list to FILE as TSV")
+    ap.add_argument("--names", action="store_true", help="print only owner/name, one per line")
+    ap.add_argument("--no-color", action="store_true", help="disable colored output")
+    a = ap.parse_args()
+    global USE_COLOR, USE_COLOR_ERR
+    if a.no_color:
+        USE_COLOR = USE_COLOR_ERR = False
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", a.account):
+        die(f"not a valid GitHub account name: {a.account!r}")
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", a.var):
+        die(f"not a valid shell variable name: {a.var!r}")
+    since = None
+    if a.pushed_since:
+        try:
+            since = datetime.strptime(a.pushed_since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            die("--pushed-since must be YYYY-MM-DD")
+
+    scope = "all" if a.all else ("private" if a.private else "public")
+    token, token_src = find_token()
+    if scope != "public" and not token:
+        die(f"--{scope} needs a token that can read the private repos. Set GITHUB_TOKEN in ghworkflowhunt "
+            "(same folder) or export GITHUB_TOKEN.")
+    info, kind, repos, scope_note = list_repos(a.account, token, scope)
+    total = len(repos)
+    counts = {v: sum(1 for r in repos if visibility(r) == v) for v in ("public", "private", "internal")}
+    for r in repos:
+        r["_pushed"] = datetime.fromisoformat((r.get("pushed_at") or "1970-01-01T00:00:00Z").replace("Z", "+00:00"))
+    if since:
+        repos = [r for r in repos if r["_pushed"] >= since]
+    if a.no_forks:
+        repos = [r for r in repos if not r.get("fork")]
+    if a.no_archived:
+        repos = [r for r in repos if not r.get("archived")]
+    repos.sort(key=lambda r: r["_pushed"], reverse=True)
+    names = [r["full_name"] for r in repos]
+
+    if a.tsv:
+        fields = ["full_name", "visibility", "pushed_at", "updated_at", "created_at", "language", "fork", "archived",
+                  "size_kb", "stars", "default_branch", "description", "html_url"]
+        with open(a.tsv, "w", encoding="utf-8", newline="") as f:
+            f.write("\t".join(fields) + "\n")
+            for r in repos:
+                vals = [r["full_name"], visibility(r), r.get("pushed_at"), r.get("updated_at"), r.get("created_at"),
+                        r.get("language"), r.get("fork"), r.get("archived"), r.get("size"),
+                        r.get("stargazers_count"), r.get("default_branch"), r.get("description"), r.get("html_url")]
+                f.write("\t".join(re.sub(r"[\t\r\n]+", " ", "" if v is None else
+                                          (str(v).lower() if isinstance(v, bool) else str(v))) for v in vals) + "\n")
+
+    filters = ", ".join(x for x in (since and f"pushed since {a.pushed_since}", a.no_forks and "no forks",
+                                    a.no_archived and "no archived") if x)
+    label = {"public": "public", "private": "private/internal", "all": "public + private"}[scope]
+    breakdown = ", ".join(f"{n} {v}" for v, n in counts.items() if n) if scope != "public" else ""
+    summary = (f"{len(names)} of {total} {label} repos" + (f" ({filters})" if filters else "")
+               + (f" · visible to the token: {breakdown}" if breakdown else ""))
+    opts = ((" --all" if scope == "all" else " --private" if scope == "private" else "")
+            + (f" --pushed-since {a.pushed_since}" if since else "")
+            + (" --no-forks" if a.no_forks else "") + (" --no-archived" if a.no_archived else ""))
+
+    if a.set:
+        # stdout carries only the assignment, so eval "$(...)" is safe; everything else to stderr
+        print(f"{a.var}=(" + " ".join(shlex.quote(n) for n in names) + ")")
+        if sys.stdout.isatty():
+            note(f'\nThat line was printed, not run. To set ${a.var} in your shell, use:\n'
+                 f'  eval "$(ghrepolist {a.account} -s{opts})"', "warn")
+        else:
+            note(f"{a.var} set for {a.account}: {summary}", "ok")
+        if a.tsv:
+            note(f"TSV saved to {a.tsv}")
+        if scope_note:
+            note(scope_note, "warn")
+        if scope != "public" and not counts["private"] and not counts["internal"]:
+            note("No private repos are visible to this token: check its resource owner, repository access, "
+                 "org approval and SSO authorization.", "warn")
+        return
+
+    if a.names:
+        print("\n".join(names))
+        return
+
+    W = 96
+    title = {"public": "Public repos", "private": "Private repos", "all": "All repos"}[scope]
+    print(paint(f" {title}: {a.account} ({kind.lower()})".ljust(W - 18) + f"ghrepolist {__version__}", "head"))
+    print(paint("─" * W, "dim"))
+    if not names:
+        print("  No repos match.")
+    else:
+        hdr = f"  {'Repo':<44}{'Last push (UTC)':<18}{'':<10}{'Language':<12}{'Size':>8}  Flags"
+        print(paint(hdr, "bold"))
+        recent = since or None
+        for r in repos:
+            v = visibility(r)
+            flags = " ".join(x for x in (v != "public" and paint(v, "warn"), r.get("fork") and "fork",
+                                         r.get("archived") and "archived") if x)
+            pushed = r["_pushed"].strftime("%Y-%m-%d %H:%M")
+            when = ago(r["_pushed"])
+            fresh = (datetime.now(timezone.utc) - r["_pushed"]).days < 7
+            size = f"{(r.get('size') or 0) / 1024:.1f}M" if (r.get("size") or 0) >= 1024 else f"{r.get('size') or 0}K"
+            line = (f"  {paint(r['full_name'][:43].ljust(44), 'flag' if fresh else '')}"
+                    f"{pushed:<18}{paint(when.ljust(10), 'warn' if fresh else 'dim')}"
+                    f"{(r.get('language') or '—')[:11]:<12}{size:>8}  {paint(flags, 'dim')}")
+            print(line.rstrip())
+    print(paint("─" * W, "dim"))
+    if scope_note:
+        print(paint(f"  {scope_note}", "warn"))
+    if scope != "public" and not counts["private"] and not counts["internal"]:
+        print(paint("  No private repos are visible to this token: check its resource owner, repository access,\n"
+                    "  org approval and SSO authorization.", "warn"))
+    print(f"  {summary}" + paint(f"  ·  pushed in the last 7 days shown in color", "dim") if names else f"  {summary}")
+    if token_src:
+        print(paint(f"  token from {token_src}", "dim"))
+    else:
+        print(paint("  no token: anonymous limit is 60 requests/hour", "dim"))
+    if a.tsv:
+        print(paint(f"  TSV saved to {a.tsv}", "dim"))
+    print(paint(f'  To use this list:  eval "$(ghrepolist {a.account} -s{opts})"', "dim"))
+
+
+if __name__ == "__main__":
+    main()

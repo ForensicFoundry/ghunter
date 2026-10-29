@@ -1,0 +1,991 @@
+#!/usr/bin/env python3
+"""
+ghimpact - impact assessment for a GitHub Actions secrets-exfiltration case.
+
+Run it after ghworkflowhunt. It reads that tool's evidence folder(s) (the
+api_runs.tsv, per-run YAML/logs/artifacts and mirror.git for each repo) and
+answers the follow-up questions in one pass:
+
+  1. Secrets stolen     Which secrets each executed attacker workflow read, and
+                        whether each one actually had a value (the run log shows
+                        "***" for a set secret, blank for an unset one). Flags
+                        multi-line secrets (private keys) an `env | grep` dump
+                        would have truncated.
+  2. Name exposure      Where the stolen secret NAMES appear in normal workflow
+                        files (current or history) across the scanned repos, i.e.
+                        whether the attacker could have read them publicly.
+  3. Artifact checks    Verifies each collected artifact's SHA-256 against the
+                        digest recorded in the run's own log (chain of custody).
+  4. Publishing         npm / PyPI / Docker Hub / GitHub releases published on or
+                        after the compromise time (stolen publishing tokens).
+  5. Commits & tags     Commits and tags created since the compromise time, with
+                        the ones made by the compromised identities called out.
+  6. Timeline           Every attacker-related event from all sources in one
+                        UTC-ordered list: run created/started/finished, job
+                        start/end, first/last log line and artifact upload (100 ns
+                        from the run logs), attacker commits, GitHub's events feed
+                        (server-side push and branch create/delete times), audit
+                        log events, releases and tags.
+
+The compromise time defaults to the earliest executed attacker run; override it
+with --since-time. Identities of interest are the actors on flagged runs and the
+authors of flagged commits; add more with --identity.
+
+Output: a formatted report on stdout, saved to <out>/impact.txt (latest) and
+<out>/impact_<timestamp>.txt, plus TSVs in <out>/:
+  impact_secrets.tsv  impact_secret_names.tsv  impact_artifacts.tsv
+  impact_releases.tsv impact_commits.tsv       impact_tags.tsv
+  impact_timeline.tsv  (columns: epoch, utc, precision, ...; sort by epoch)
+
+All times are UTC, shown as YYYY-MM-DD HH:MM:SS (plus fractional seconds when
+the source has them).
+
+Examples:
+  ghimpact                                     # ./evidence
+  ghimpact -e evidence -e evidence-wave2       # combine several hunt runs
+  ghimpact -e /cases/acme/evidence -o /cases/acme/impact
+  ghimpact --since-time 2026-10-23T14:45:00Z --identity dev-deploy
+  ghimpact --docker-image acme/agent --deep
+
+A GitHub token is optional (used only for GitHub releases). It is read the same
+way as ghtokenusage: ghworkflowhunt next to this script, then $GITHUB_TOKEN /
+$GH_TOKEN. Color is used only on a terminal; NO_COLOR=1 or --no-color disables it.
+
+Requires: Python 3.8+, git on PATH. No third-party packages.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+__version__ = "26.09.01"
+
+if os.name == "nt":
+    os.system("")
+
+# --------------------------------------------------------------------------- output
+
+
+def _color_enabled(stream):
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return hasattr(stream, "isatty") and stream.isatty() and os.environ.get("TERM") != "dumb"
+
+
+USE_COLOR = _color_enabled(sys.stderr)
+USE_COLOR_OUT = _color_enabled(sys.stdout)
+_STYLES = {"info": "", "ok": "32", "warn": "33", "error": "1;31", "flag": "1;35",
+           "head": "1;36", "dim": "2", "bold": "1"}
+
+
+def paint(text, style, enabled=None):
+    code = _STYLES.get(style, style)
+    on = USE_COLOR if enabled is None else enabled
+    return f"\033[{code}m{text}\033[0m" if on and code else text
+
+
+def log(msg, level="info"):
+    ts = paint(datetime.now().strftime("%H:%M:%S"), "dim")
+    print(f"[{ts}] {paint(msg, level)}", file=sys.stderr)
+
+
+def die(msg):
+    log(msg, "error")
+    sys.exit(1)
+
+
+def write_tsv(path, rows, fields):
+    def clean(v):
+        return re.sub(r"[\t\r\n]+", " ", "" if v is None else str(v))
+    with path.open("w", encoding="utf-8", newline="") as f:
+        f.write("\t".join(fields) + "\n")
+        for r in rows:
+            f.write("\t".join(clean(r.get(k, "")) for k in fields) + "\n")
+
+
+def read_tsv(path):
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if not lines:
+        return []
+    head = lines[0].split("\t")
+    return [dict(zip(head, ln.split("\t") + [""] * (len(head) - len(ln.split("\t")))))
+            for ln in lines[1:] if ln]
+
+
+def _fit(text, width):
+    text = "" if text is None else str(text)
+    return text if len(text) <= width else text[:max(1, width - 1)] + "…"
+
+
+def table(headers, rows, widths, color, indent="  "):
+    def cell(v, w):
+        txt, style = v if isinstance(v, tuple) else (v, "")
+        txt = _fit(txt, w).ljust(w)
+        return paint(txt, style, color) if style else txt
+    out = [paint((indent + "  ".join(_fit(h, w).ljust(w) for h, w in zip(headers, widths))).rstrip(),
+                 "head", color),
+           indent + "  ".join("─" * w for w in widths)]
+    for r in rows:
+        out.append(indent + "  ".join(cell(v, w) for v, w in zip(r, widths)).rstrip())
+    return out
+
+
+# --------------------------------------------------------------------------- helpers
+
+def git(args, cwd, check=False):
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
+                       errors="replace", env=env)
+    if check and r.returncode != 0:
+        raise RuntimeError(r.stderr.strip())
+    return r.stdout
+
+
+def parse_time(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def iso(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S") if dt else ""
+
+
+# Timeline stamps keep whatever precision the source has: (epoch_seconds, fraction_digits)
+_ISO = re.compile(r"^\s*(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)(?:\.(\d+))?\s*(Z|[+-]\d\d:?\d\d)?\s*$")
+PRECISION = {0: "1 s", 1: "100 ms", 2: "10 ms", 3: "1 ms", 4: "100 µs", 5: "10 µs", 6: "1 µs", 7: "100 ns",
+             8: "10 ns", 9: "1 ns"}
+
+
+def stamp(value):
+    """ISO-8601 string (any offset) or epoch milliseconds -> (epoch_int, fraction_str), UTC."""
+    if isinstance(value, (int, float)):
+        ms = int(value)
+        return ms // 1000, f"{ms % 1000:03d}"
+    m = _ISO.match(value or "")
+    if not m:
+        return None
+    date, clock, frac, tz = m.groups()
+    tz = "+00:00" if tz in (None, "Z") else (tz if ":" in tz else f"{tz[:3]}:{tz[3:]}")
+    return int(datetime.fromisoformat(f"{date}T{clock}{tz}").timestamp()), frac or ""
+
+
+def stamp_utc(st):
+    return datetime.fromtimestamp(st[0], timezone.utc).strftime("%Y-%m-%d %H:%M:%S") + (f".{st[1]}" if st[1] else "")
+
+
+def stamp_epoch(st):
+    return f"{st[0]}.{st[1]}" if st[1] else str(st[0])
+
+
+TOKEN_LINE = re.compile(r"""^GITHUB_TOKEN\s*=\s*["']([^"']*)["']""", re.MULTILINE)
+
+
+def find_token():
+    here = Path(__file__).resolve().parent
+    for name in ("ghworkflowhunt", "ghworkflowhunt.py"):
+        p = here / name
+        if p.is_file():
+            m = TOKEN_LINE.search(p.read_text(encoding="utf-8", errors="replace"))
+            if m and m.group(1).strip():
+                return m.group(1).strip()
+    return (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+
+
+def http_json(url, token=None):
+    """GET JSON. Returns (status, data); status 0 on network failure."""
+    headers = {"User-Agent": f"ghimpact/{__version__}", "Accept": "application/json"}
+    if token and urllib.parse.urlparse(url).hostname == "api.github.com":
+        headers["Authorization"] = f"Bearer {token}"
+        headers["Accept"] = "application/vnd.github+json"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as r:
+            return r.status, json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, None
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return 0, None
+
+
+_LOG_TS = re.compile(r"^\ufeff?\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?")
+
+
+def log_lines(zip_path):
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            for name in z.namelist():
+                if not name.endswith("/"):
+                    for raw in z.read(name).decode("utf-8", "replace").splitlines():
+                        yield re.sub(r"\x1b\[[0-9;]*m", "", _LOG_TS.sub("", raw))
+    except (zipfile.BadZipFile, OSError):
+        return
+
+
+def sha256_file(p):
+    h = hashlib.sha256()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# --------------------------------------------------------------------------- evidence loading
+
+def load_repos(evidence_dirs, only):
+    """Find repo folders written by ghworkflowhunt. Returns list of dicts."""
+    repos = []
+    for ev in evidence_dirs:
+        ev = Path(ev)
+        if not ev.is_dir():
+            die(f"evidence folder not found: {ev}")
+        for d in sorted(ev.iterdir()):
+            if not (d.is_dir() and (d / "mirror.git").is_dir()):
+                continue
+            name = d.name.replace("__", "/", 1)
+            if only and name not in only:
+                continue
+            repos.append({"name": name, "dir": d, "mirror": d / "mirror.git",
+                          "runs": read_tsv(d / "api_runs.tsv"),
+                          "commits": read_tsv(d / "git_workflow_commits.tsv")})
+    if not repos:
+        die("no ghworkflowhunt repo folders (with mirror.git) found in: " + ", ".join(map(str, evidence_dirs)))
+    return repos
+
+
+def executed_attacker_runs(repo):
+    return [r for r in repo["runs"] if r.get("flagged") == "strong"
+            and "yaml" in r.get("matched_via", "") and r.get("executed") == "yes"]
+
+
+# --------------------------------------------------------------------------- 1. secrets
+
+EXPR = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+SECRET_REF = re.compile(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)|secrets\[\s*['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s*\]")
+ENV_MAP = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*\$\{\{\s*secrets\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}",
+                     re.M)
+MULTILINE_HINT = re.compile(r"PRIVATE|PEM|CERT|SSH_KEY|SIGNING_KEY|GPG|PGP|KEYSTORE|P12|PFX", re.I)
+LINE_FILTER = re.compile(r"\benv\b[^|\n]*\|\s*grep\b|\bprintenv\b[^|\n]*\|\s*grep\b")
+
+
+def secrets_in_yaml(yml):
+    names, dump_all = [], False
+    for expr in EXPR.findall(yml or ""):
+        if re.search(r"toJSON\(\s*secrets\s*\)", expr):
+            dump_all = True
+        for a, b in SECRET_REF.findall(expr):
+            n = a or b
+            if n not in names:
+                names.append(n)
+    return names, dump_all
+
+
+def analyze_secrets(repos):
+    rows = []
+    for repo in repos:
+        for run in executed_attacker_runs(repo):
+            rd = repo["dir"] / "runs" / run["run_id"]
+            ymls = [p for p in rd.glob("*.y*ml")]
+            yml = ymls[0].read_text(encoding="utf-8", errors="replace") if ymls else ""
+            names, dump_all = secrets_in_yaml(yml)
+            env_of = {sec: env for env, sec in ENV_MAP.findall(yml)}
+            logged = {}
+            for line in log_lines(rd / "logs.zip"):
+                m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*):\s?(.*)$", line)
+                if m and m.group(1) in env_of.values():
+                    v = m.group(2).strip()
+                    logged.setdefault(m.group(1), "has value" if v == "***" else ("EMPTY" if v == "" else "unclear"))
+            filtered = bool(LINE_FILTER.search(yml))
+            if dump_all:
+                rows.append({"repo": repo["name"], "run_id": run["run_id"], "workflow": Path(run["path"]).name,
+                             "created_at": run["created_at"], "secret": "(ALL via toJSON(secrets))",
+                             "env_var": "", "status": "has value", "note": "every secret available to the run"})
+            for n in names:
+                env = env_of.get(n, "")
+                status = logged.get(env, "unknown") if env else "unknown"
+                note = ""
+                if n == "GITHUB_TOKEN":
+                    note = "per-run token; expired when the job ended"
+                elif filtered and MULTILINE_HINT.search(n):
+                    note = "multi-line value likely truncated by `env | grep` (first line only)"
+                rows.append({"repo": repo["name"], "run_id": run["run_id"], "workflow": Path(run["path"]).name,
+                             "created_at": run["created_at"], "secret": n, "env_var": env,
+                             "status": status, "note": note})
+    return rows
+
+
+# --------------------------------------------------------------------------- 2. name exposure
+
+def attacker_commits(repo):
+    s = {c["commit"] for c in repo["commits"] if c.get("flagged")}
+    s |= {r["head_sha"] for r in repo["runs"] if r.get("flagged") == "strong" and r.get("head_sha")}
+    return s
+
+
+def name_exposure(repos, names, deep):
+    rows = []
+    for repo in repos:
+        bad = attacker_commits(repo)
+        scope = [] if deep else ["--", ".github"]
+        for n in names:
+            current = [p for p in git(["grep", "-l", "-w", n, "HEAD", *scope], repo["mirror"]).splitlines()
+                       if not re.search(r"/zzx?-", p)]
+            hist = git(["log", "--all", "--format=%H\x1f%cI\x1f%an", "-S", n, *scope], repo["mirror"]).splitlines()
+            hist = [h.split("\x1f") for h in hist if h and h.split("\x1f")[0] not in bad]
+            if current or hist:
+                first = min(hist, key=lambda h: h[1]) if hist else None
+                rows.append({"secret": n, "repo": repo["name"],
+                             "current_files": ";".join(p.split(":", 1)[-1] for p in current),
+                             "first_seen_commit": first[0][:12] if first else "",
+                             "first_seen_date": first[1] if first else "",
+                             "first_seen_author": first[2] if first else ""})
+    return rows
+
+
+# --------------------------------------------------------------------------- 3. artifacts
+
+def artifact_checks(repos):
+    rows = []
+    for repo in repos:
+        for run in repo["runs"]:
+            arts = sorted((repo["dir"] / "runs" / run["run_id"] / "artifacts").glob("*.zip")) \
+                if run.get("flagged") else []
+            for a in arts:
+                digest = sha256_file(a)
+                logged = run.get("upload_digest", "")
+                rows.append({"repo": repo["name"], "run_id": run["run_id"], "file": str(a),
+                             "bytes": a.stat().st_size, "sha256": digest, "log_sha256": logged,
+                             "match": ("MATCH" if digest == logged else "DIFFERS") if logged else "no log digest"})
+    return rows
+
+
+# --------------------------------------------------------------------------- 4. publishing
+
+def show(mirror, path):
+    return git(["show", f"HEAD:{path}"], mirror)
+
+
+def package_names(repo):
+    files = git(["ls-tree", "-r", "--name-only", "HEAD"], repo["mirror"]).splitlines()
+    npm, pypi, docker = [], [], []
+    for f in files:
+        if "node_modules/" in f or f.count("/") > 2:
+            continue
+        base = f.rsplit("/", 1)[-1]
+        if base == "package.json":
+            try:
+                j = json.loads(show(repo["mirror"], f) or "{}")
+                if j.get("name") and not j.get("private"):
+                    npm.append(j["name"])
+            except json.JSONDecodeError:
+                pass
+        elif base in ("pyproject.toml", "setup.cfg", "setup.py"):
+            txt = show(repo["mirror"], f)
+            m = (re.search(r"^\[(?:project|tool\.poetry)\][^\[]*?^\s*name\s*=\s*[\"']([^\"']+)", txt, re.M | re.S)
+                 if base == "pyproject.toml" else
+                 re.search(r"^\s*name\s*=\s*([^\s#]+)", txt, re.M) if base == "setup.cfg" else
+                 re.search(r"\bname\s*=\s*[\"']([^\"']+)", txt))
+            if m:
+                pypi.append(m.group(1).strip("\"'"))
+    for f in files:
+        if f.startswith(".github/workflows/") and f.endswith((".yml", ".yaml")):
+            for line in show(repo["mirror"], f).splitlines():
+                if re.search(r"\b(images?|tags|repository)\s*:|docker\.io/", line) and "ghcr.io" not in line:
+                    for m in re.finditer(r"(?:docker\.io/)?\b([a-z0-9]+(?:[._-][a-z0-9]+)*/[a-z0-9]+(?:[._-][a-z0-9]+)*)"
+                                         r"(?=[:\s,\"'\]]|$)", line):
+                        cand = m.group(1)
+                        if "${{" not in line[max(0, m.start() - 3):m.end()] and not cand.startswith(
+                                ("actions/", "docker/", "github/", "refs/")):
+                            docker.append(cand)
+    return list(dict.fromkeys(npm)), list(dict.fromkeys(pypi)), list(dict.fromkeys(docker))
+
+
+def registry_checks(repos, since, token, extra_docker):
+    rows, notes = [], []
+    seen_images = set()
+    missing = {}  # (repo, registry) -> [package names not published]
+
+    def docker_tags(img, label, quiet_404):
+        if img in seen_images or "/" not in img:
+            return
+        seen_images.add(img)
+        ns, name = img.split("/", 1)
+        st, d = http_json(f"https://hub.docker.com/v2/repositories/{ns}/{name}/tags/?page_size=100"
+                          f"&ordering=last_updated")
+        if st != 200:
+            if not (quiet_404 and st == 404):
+                why = "not found" if st == 404 else f"lookup failed ({st or 'network'})"
+                notes.append(f"Docker Hub {img}: {why}")
+            return
+        for t in d.get("results", []):
+            add("Docker Hub", label, img, t.get("name", ""), t.get("last_updated", ""),
+                t.get("last_updater_username", ""), f"https://hub.docker.com/r/{img}/tags")
+
+    fork_of = ""
+
+    def add(kind, repo, pkg, version, when, who, url):
+        t = parse_time(when)
+        after = t and t >= since
+        upstream = fork_of and kind in ("npm", "PyPI")
+        rows.append({"registry": kind, "repo": repo, "package": pkg, "version": version,
+                     "published_utc": iso(t), "published_raw": when, "published_by": who or "",
+                     "after_compromise": ("UPSTREAM" if upstream else "YES") if after else "",
+                     "repo_note": f"repo is a fork of {fork_of}" if fork_of else "", "url": url})
+
+    for repo in repos:
+        st, info = http_json(f"https://api.github.com/repos/{repo['name']}", token)
+        fork_of = ((info or {}).get("parent") or {}).get("full_name", "") if st == 200 and (info or {}).get("fork") \
+            else ""
+        if fork_of:
+            notes.append(f"{repo['name']} is a fork of {fork_of}: its npm/PyPI packages are normally published "
+                         f"upstream, so their releases are listed separately")
+        npm, pypi, docker = package_names(repo)
+        for n in npm:
+            st, d = http_json("https://registry.npmjs.org/" + urllib.parse.quote(n, safe="@"))
+            if st != 200:
+                if st == 404:
+                    missing.setdefault((repo["name"], "npm"), []).append(n)
+                else:
+                    notes.append(f"npm {n} ({repo['name']}): lookup failed ({st or 'network'})")
+                continue
+            for v, when in (d.get("time") or {}).items():
+                if v in ("created", "modified"):
+                    continue
+                who = ((d.get("versions") or {}).get(v) or {}).get("_npmUser", {}).get("name", "")
+                add("npm", repo["name"], n, v, when, who, f"https://www.npmjs.com/package/{n}/v/{v}")
+        for n in pypi:
+            st, d = http_json(f"https://pypi.org/pypi/{urllib.parse.quote(n)}/json")
+            if st != 200:
+                if st == 404:
+                    missing.setdefault((repo["name"], "PyPI"), []).append(n)
+                else:
+                    notes.append(f"PyPI {n} ({repo['name']}): lookup failed ({st or 'network'})")
+                continue
+            for v, files in (d.get("releases") or {}).items():
+                if files:
+                    add("PyPI", repo["name"], n, v, min(f.get("upload_time_iso_8601", "") for f in files), "",
+                        f"https://pypi.org/project/{n}/{v}/")
+        for img in docker:
+            docker_tags(img, repo["name"], quiet_404=True)
+        st, d = http_json(f"https://api.github.com/repos/{repo['name']}/releases?per_page=50", token)
+        if st == 200:
+            for r in d:
+                add("GitHub release", repo["name"], repo["name"], r.get("tag_name", ""),
+                    r.get("published_at") or r.get("created_at"), (r.get("author") or {}).get("login", ""),
+                    r.get("html_url", ""))
+        elif st not in (404,):
+            notes.append(f"GitHub releases {repo['name']}: lookup failed ({st or 'network'})")
+    fork_of = ""
+    for img in extra_docker:
+        docker_tags(img, "(--docker-image)", quiet_404=False)
+    for (repo, reg), names in sorted(missing.items()):
+        shown = ", ".join(names[:3]) + (f" and {len(names) - 3} more" if len(names) > 3 else "")
+        notes.append(f"{repo}: {len(names)} {reg} package name(s) in the repo aren't published ({shown})")
+    return rows, notes
+
+
+# --------------------------------------------------------------------------- 5. commits & tags
+
+def identities_of(repos, extra):
+    ids = set(i.lower() for i in extra)
+    for repo in repos:
+        for r in repo["runs"]:
+            if r.get("flagged") == "strong":
+                for k in ("actor", "triggering_actor"):
+                    if r.get(k):
+                        ids.add(r[k].lower())
+        for c in repo["commits"]:
+            if c.get("flagged") and c.get("author"):
+                ids.add(c["author"].split(" <")[0].lower())
+                m = re.search(r"<([^>]+)>", c["author"])
+                if m:
+                    ids.add(m.group(1).lower())
+    ids.discard("")
+    return sorted(ids)
+
+
+def who_set(fields):
+    """Exact-match keys for a commit's author/committer: names, emails, and the login
+    part of GitHub noreply emails (12345+login@users.noreply.github.com)."""
+    out = set()
+    for f in fields:
+        f = f.strip().lower()
+        if not f:
+            continue
+        out.add(f)
+        if "@" in f:
+            local = f.split("@", 1)[0]
+            out.add(local)
+            out.add(local.split("+", 1)[-1])
+    return out
+
+
+def commits_since(repos, since, ids):
+    rows = []
+    for repo in repos:
+        fmt = "%H%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%cI%x1f%s"
+        for ln in git(["log", "--all", f"--since={since.isoformat()}", f"--format={fmt}"], repo["mirror"]).splitlines():
+            p = ln.split("\x1f")
+            if len(p) < 7:
+                continue
+            hit = [i for i in ids if i in who_set(p[1:5])]
+            rows.append({"repo": repo["name"], "commit": p[0], "committed_utc": iso(parse_time(p[5])),
+                         "committed_raw": p[5],
+                         "tz": p[5][-6:] if re.search(r"[+-]\d\d:\d\d$", p[5]) else "Z",
+                         "author": f"{p[1]} <{p[2]}>", "committer": f"{p[3]} <{p[4]}>",
+                         "identity_of_interest": ";".join(hit), "subject": p[6]})
+    return rows
+
+
+def tags_since(repos, since):
+    rows = []
+    for repo in repos:
+        out = git(["for-each-ref", "refs/tags", "--format=%(refname:short)\x1f%(creatordate:iso-strict)\x1f"
+                   "%(objectname)\x1f%(*objectname)\x1f%(taggername)"], repo["mirror"])
+        for ln in out.splitlines():
+            p = ln.split("\x1f")
+            t = parse_time(p[1]) if len(p) > 1 else None
+            if t and t >= since:
+                rows.append({"repo": repo["name"], "tag": p[0], "created_utc": iso(t), "created_raw": p[1],
+                             "commit": (p[3] or p[2])[:12], "tagger": p[4] if len(p) > 4 else ""})
+    return rows
+
+
+# --------------------------------------------------------------------------- 6. timeline
+
+REPORT_EVENTS = {"run created", "artifact uploaded", "branch created", "branch deleted", "tag created",
+                 "tag deleted", "push", "commit (identity of interest)", "workflow commit (attacker)",
+                 "published", "tag (since compromise)", "audit log"}
+
+
+def gh_events(repo, token, pages=3):
+    """Recent repo events (server-side times). The API keeps ~90 days / 300 events."""
+    out = []
+    for page in range(1, pages + 1):
+        st, d = http_json(f"https://api.github.com/repos/{repo}/events?per_page=100&page={page}", token)
+        if st != 200 or not d:
+            break
+        out += d
+        if len(d) < 100:
+            break
+    return out
+
+
+def build_timeline(repos, ids, ref_rx, cm, tags, rel, use_events, token, out_dir, since):
+    rows, notes = [], []
+    since_events = {}
+    seen = set()
+    floor = int(since.timestamp())
+
+    def add(when, precision_src, repo, source, event, actor="", run_id="", ref="", sha="", detail=""):
+        st = stamp(when) if not isinstance(when, tuple) else when
+        if not st or st[0] < floor:
+            return
+        # Run logs repeat lines across per-step and per-job files: keep one per run/event/detail
+        key = (repo, run_id, event, detail, sha) if source == "actions-log" else (repo, source, event, st, ref, sha, detail)
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append({"_k": (st[0], st[1].ljust(9, "0")), "epoch": stamp_epoch(st), "utc": stamp_utc(st),
+                     "precision": PRECISION.get(len(st[1]), f"{len(st[1])} digits"), "repo": repo,
+                     "source": source, "event": event, "actor": actor, "run_id": run_id, "ref": ref,
+                     "sha": sha, "detail": detail})
+
+    for repo in repos:
+        name = repo["name"]
+        for r in repo["runs"]:
+            if r.get("flagged") != "strong":
+                continue
+            rid, rd = r["run_id"], repo["dir"] / "runs" / r["run_id"]
+            run = {}
+            if (rd / "run.json").exists():
+                run = json.loads((rd / "run.json").read_text(encoding="utf-8", errors="replace"))
+            wf, br = Path(r.get("path", "")).name, r.get("head_branch", "")
+            who = r.get("triggering_actor") or r.get("actor", "")
+            base = dict(actor=who, run_id=rid, ref=br, sha=r.get("head_sha", "")[:12])
+            add(run.get("created_at") or r.get("created_at"), None, name, "actions-api", "run created",
+                detail=" · ".join(x for x in (wf, r.get("event", ""), r.get("conclusion", ""),
+                                              r.get("matched_via") and f"via {r['matched_via']}") if x), **base)
+            if run.get("run_started_at") and run.get("run_started_at") != run.get("created_at"):
+                add(run["run_started_at"], None, name, "actions-api", "run started", detail=wf, **base)
+            if run.get("updated_at"):
+                add(run["updated_at"], None, name, "actions-api", "run last updated",
+                    detail=f"{wf} · {r.get('conclusion', '')}", **base)
+            if (rd / "jobs.json").exists():
+                for j in json.loads((rd / "jobs.json").read_text(encoding="utf-8")).get("jobs", []):
+                    if j.get("started_at"):
+                        add(j["started_at"], None, name, "actions-api", "job started",
+                            detail=f"{j.get('name', '')} · runner {j.get('runner_name') or '?'}", **base)
+                    if j.get("completed_at"):
+                        add(j["completed_at"], None, name, "actions-api", "job completed",
+                            detail=f"{j.get('name', '')} · {j.get('conclusion', '')}", **base)
+            first = last = None
+            for line in _raw_log_lines(rd / "logs.zip"):
+                m = re.match(r"^\ufeff?(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z)\s?(.*)$", line)
+                if not m:
+                    continue
+                t, text = m.groups()
+                first = first or t
+                last = t
+                a = re.search(r"Artifact ID (?:is )?(\d+)", text)
+                if a:
+                    add(t, None, name, "actions-log", "artifact uploaded", detail=f"artifact {a.group(1)}", **base)
+            if first:
+                add(first, None, name, "actions-log", "first log line", detail=wf, **base)
+                add(last, None, name, "actions-log", "last log line", detail=wf, **base)
+        for c in repo["commits"]:
+            if c.get("flagged"):
+                tz = (c.get("committer_date", "") or "")[-6:]
+                add(c.get("committer_date", ""), None, name, "git-commit", "workflow commit (attacker)",
+                    actor=c.get("author", "").split(" <")[0], sha=c["commit"][:12],
+                    detail=f"{c.get('change', '')} {c.get('file', '')} · original offset {tz or '?'} · forgeable")
+        if (repo["dir"] / "audit_log_events.json").exists():
+            for e in json.loads((repo["dir"] / "audit_log_events.json").read_text(encoding="utf-8")):
+                add(e.get("@timestamp") or e.get("created_at"), None, name, "audit-log", "audit log",
+                    actor=e.get("actor", ""), detail=e.get("action", ""))
+        if use_events:
+            evs = gh_events(name, token)
+            (out_dir / f"impact_events_{name.replace('/', '__')}.json").write_text(json.dumps(evs, indent=2))
+            if evs:
+                oldest = min(e.get("created_at", "") for e in evs)
+                since_events[name] = oldest
+            for e in evs:
+                actor = (e.get("actor") or {}).get("login", "")
+                pl = e.get("payload") or {}
+                ref = (pl.get("ref") or "").replace("refs/heads/", "")
+                interesting = actor.lower() in ids or (ref and ref_rx.search(ref))
+                if not interesting:
+                    continue
+                t = e.get("type", "")
+                if t == "PushEvent":
+                    n = pl.get("size", pl.get("distinct_size"))
+                    ev, det = "push", (f"{n} commit(s) · " if n is not None else "") + f"head {(pl.get('head') or '')[:12]}"
+                elif t in ("CreateEvent", "DeleteEvent"):
+                    verb = "created" if t == "CreateEvent" else "deleted"
+                    ev, det = f"{pl.get('ref_type', 'ref')} {verb}", ""
+                elif t == "PullRequestEvent":
+                    ev, det = "pull request", f"#{pl.get('number')} {pl.get('action')}"
+                elif t == "ReleaseEvent":
+                    ev, det = "release", f"{(pl.get('release') or {}).get('tag_name', '')} {pl.get('action')}"
+                else:
+                    ev, det = t.replace("Event", "").lower(), pl.get("action", "") or ""
+                add(e.get("created_at"), None, name, "events-api", ev, actor=actor, ref=ref,
+                    sha=(pl.get("head") or "")[:12], detail=det)
+    attacker_shas = {r["sha"] for r in rows if r["event"] == "workflow commit (attacker)"}
+    for c in cm:
+        if c["identity_of_interest"] and c["commit"][:12] not in attacker_shas:
+            add(c["committed_raw"], None, c["repo"], "git-commit", "commit (identity of interest)",
+                actor=c["author"].split(" <")[0], sha=c["commit"][:12],
+                detail=f"{c['subject']} · original offset {c['tz']} · commit date is forgeable")
+    for t in tags:
+        add(t["created_raw"], None, t["repo"], "git-tag", "tag (since compromise)", actor=t["tagger"],
+            ref=t["tag"], sha=t["commit"])
+    for r in rel:
+        if r["after_compromise"]:
+            up = r["after_compromise"] == "UPSTREAM"
+            add(r["published_raw"], None, r["repo"], r["registry"].lower(), "published (upstream)" if up else "published",
+                actor=r["published_by"], ref=r["version"],
+                detail=r["package"] + (f" · {r['repo_note']}" if up else ""))
+    rows.sort(key=lambda r: r["_k"])
+    return rows, since_events
+
+
+def _raw_log_lines(zip_path):
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            for n in z.namelist():
+                if not n.endswith("/"):
+                    yield from z.read(n).decode("utf-8", "replace").splitlines()
+    except (zipfile.BadZipFile, OSError):
+        return
+
+
+# --------------------------------------------------------------------------- report
+
+def _fmt(iso_str):
+    t = parse_time(iso_str)
+    return iso(t) if t else iso_str
+
+
+def render(ctx, color):
+    W = 78
+    L = []
+    rule = paint("═" * W, "head", color)
+    L += [rule, paint(" GitHub compromise — impact assessment".ljust(W - 14) + f"ghimpact {__version__}",
+                      "head", color), rule]
+
+    def kv(k, v, style=""):
+        L.append(f"  {k:<26}{paint(str(v), style, color) if style else v}")
+
+    def section(title, style="head"):
+        L.extend(["", paint(f"── {title} " + "─" * max(3, W - len(title) - 4), style, color)])
+
+    def note(text):
+        L.append(paint("  " + text.replace("\n", "\n  "), "dim", color))
+
+    kv("Generated (UTC)", ctx["generated"])
+    kv("Evidence", ", ".join(ctx["evidence"]))
+    kv("Repos in evidence", f"{len(ctx['repos'])}  ({len(ctx['hit_repos'])} with executed attacker code)",
+       "flag" if ctx["hit_repos"] else "ok")
+    kv("Compromise time (UTC)", f"{iso(ctx['since'])}  ({ctx['since_src']})")
+    kv("Identities of interest", ", ".join(ctx["ids"]) or "—")
+
+    # 1 secrets
+    sec = ctx["secrets"]
+    section("1. Secrets read by attacker code that executed", "flag" if sec else "head")
+    if not sec:
+        L.append("  No executed attacker workflow referenced any secret.")
+    else:
+        def st(v):
+            return {"has value": ("STOLEN", "error"), "EMPTY": ("empty (not set)", "ok"),
+                    "unknown": ("unknown", "warn"), "unclear": ("unclear", "warn")}.get(v, v)
+        L += table(["Repo", "Secret", "Value in run", "Run ID", "Note"],
+                   [[r["repo"].split("/")[-1], r["secret"], st(r["status"]), r["run_id"], r["note"]] for r in sec],
+                   [22, 30, 15, 11, 40], color)
+        note("Value in run comes from the step's env block in the run log: *** = the secret was set and\n"
+             "went into the dump; blank = not set for that repo. unknown = used inline, so the log can't tell.")
+        stolen = sorted({r["secret"] for r in sec if r["status"] in ("has value", "unknown", "unclear")})
+        L += ["", paint("  Rotate now (stolen or can't rule out):", "bold", color)]
+        L += [f"    {paint('•', 'error', color)} {s}" for s in stolen]
+
+    # 2 names
+    section("2. Where the stolen secret names were visible")
+    names = ctx["names"]
+    if not ctx["secret_names"]:
+        L.append("  Nothing to check.")
+    else:
+        found = {r["secret"] for r in names}
+        if names:
+            L += table(["Secret", "Repo", "In current files", "First seen", "By"],
+                       [[r["secret"], r["repo"].split("/")[-1], r["current_files"] or "—",
+                         r["first_seen_date"][:10] or "—", r["first_seen_author"] or "—"] for r in names],
+                       [30, 20, 34, 10, 16], color)
+        missing = [n for n in ctx["secret_names"] if n not in found]
+        if missing:
+            L.append(paint(f"  Not found in any scanned repo's {'history' if ctx['deep'] else 'workflow files'}: "
+                           + ", ".join(missing), "warn", color))
+            note("The attacker knew these names without reading them from these repos' workflows. Repo admins\n"
+                 "and GitHub Apps with secrets permission can list secret names; check who had that access."
+                 + ("" if ctx["deep"] else "\nRe-run with --deep to search all files and full history."))
+
+    # 3 artifacts
+    section("3. Collected artifacts: integrity check")
+    if not ctx["artifacts"]:
+        L.append("  No artifacts were collected.")
+    else:
+        L += table(["Repo", "Run ID", "Bytes", "SHA-256 (downloaded)", "Matches log"],
+                   [[r["repo"].split("/")[-1], r["run_id"], r["bytes"], r["sha256"][:16] + "…",
+                     (r["match"], "ok" if r["match"] == "MATCH" else "warn")] for r in ctx["artifacts"]],
+                   [22, 11, 8, 20, 14], color)
+        note("MATCH = the file you hold is byte-for-byte what the run uploaded (digest from its own log).")
+
+    # 4 publishing
+    rel = ctx["releases"]
+    after = [r for r in rel if r["after_compromise"] == "YES"]
+    upstream = [r for r in rel if r["after_compromise"] == "UPSTREAM"]
+    section("4. Packages and releases published since the compromise", "flag" if after else "head")
+    if ctx["no_registry"]:
+        L.append("  Skipped (--no-registry).")
+    else:
+        checked = sorted({f"{r['registry']}: {r['package']}" for r in rel})
+        kv("Checked", ", ".join(checked) if checked else "no packages detected")
+        if after:
+            L += table(["Registry", "Package", "Version", "Published (UTC)", "By"],
+                       [[r["registry"], r["package"], (r["version"], "flag"), r["published_utc"], r["published_by"] or "—"]
+                        for r in sorted(after, key=lambda r: r["published_utc"])],
+                       [14, 30, 18, 19, 16], color)
+            note("Confirm every one of these with the client. Anything they didn't publish is attacker-made:\n"
+                 "deprecate/yank it, and notify users who installed it.")
+        else:
+            L.append(paint("  Nothing published on or after the compromise time.", "ok", color))
+        if upstream:
+            pk = sorted({f"{r['package']} ({r['repo_note']})" for r in upstream})
+            L.append(paint(f"  Also {len(upstream)} release(s) of upstream packages from forked repos: " + "; ".join(pk)
+                           + ". Normally published by the upstream project, not the client; confirm the client "
+                             "doesn't publish them.", "dim", color))
+        for n in ctx["release_notes"]:
+            L.append(paint(f"  · {n}", "dim", color))
+
+    # 5 commits & tags
+    cm = ctx["commits"]
+    flagged = [c for c in cm if c["identity_of_interest"]]
+    section("5. Commits and tags since the compromise", "flag" if flagged or ctx["tags"] else "head")
+    per = {}
+    for c in cm:
+        per.setdefault(c["repo"], [0, 0])
+        per[c["repo"]][0] += 1
+        per[c["repo"]][1] += bool(c["identity_of_interest"])
+    if per:
+        L += table(["Repo", "Commits since", "By identities of interest"],
+                   [[r, n, (str(k), "flag") if k else ("0", "dim")] for r, (n, k) in sorted(per.items())],
+                   [40, 13, 26], color)
+    else:
+        L.append("  No commits since the compromise time.")
+    if flagged:
+        L += ["", paint(f"  By identities of interest ({len(flagged)})", "bold", color)]
+        L += table(["Committed (UTC)", "Repo", "Commit", "Author", "Subject"],
+                   [[c["committed_utc"], c["repo"].split("/")[-1], c["commit"][:12],
+                     c["author"].split(" <")[0], c["subject"]] for c in sorted(flagged, key=lambda c: c["committed_utc"])],
+                   [19, 18, 12, 16, 34], color)
+    if ctx["tags"]:
+        L += ["", paint(f"  Tags created since ({len(ctx['tags'])})", "bold", color)]
+        L += table(["Created (UTC)", "Repo", "Tag", "Commit", "Tagger"],
+                   [[t["created_utc"], t["repo"].split("/")[-1], (t["tag"], "flag"), t["commit"], t["tagger"] or "—"]
+                    for t in sorted(ctx["tags"], key=lambda t: t["created_utc"])],
+                   [19, 22, 24, 12, 16], color)
+    note("Commit dates come from the commit itself and can be forged. A tag moved to a different commit\n"
+         "keeps its old date, so compare tags against a known-good copy for published Actions.")
+
+    tl = [r for r in ctx["timeline"] if r["event"] in REPORT_EVENTS]
+    section(f"6. Timeline of attacker activity ({len(tl)} key events, UTC)", "head")
+    if not tl:
+        L.append("  No events.")
+    else:
+        L += table(["UTC", "Repo", "Event", "Actor", "Ref / run", "Detail"],
+                   [[r["utc"][:23], r["repo"].split("/")[-1], (r["event"], "flag" if r["event"] in
+                     ("branch deleted", "tag deleted", "published", "artifact uploaded") else ""),
+                     r["actor"], r["ref"] or r["run_id"], r["detail"]] for r in tl],
+                   [23, 18, 26, 16, 18, 40], color)
+    note(f"impact_timeline.tsv has all {len(ctx['timeline'])} events, including job start/finish and first/last\n"
+         "log lines. Sort by the epoch column; the precision column says how exact each time is\n"
+         "(Actions logs: 100 ns, audit log: 1 ms, API and git: 1 s).")
+    for repo, oldest in sorted(ctx["events_reach"].items()):
+        if parse_time(oldest) and parse_time(oldest) > ctx["since"]:
+            L.append(paint(f"  · events API for {repo} only reaches back to {_fmt(oldest)}: earlier pushes/branch "
+                           "deletions there are not in this timeline", "warn", color))
+
+    section("Files")
+    for f in ctx["files"]:
+        L.append(f"    {f}")
+    L += ["", rule]
+    return "\n".join(L) + "\n"
+
+
+# --------------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(prog="ghimpact", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
+    ap.add_argument("-e", "--evidence", action="append", metavar="DIR",
+                    help="ghworkflowhunt output folder; repeatable (default: evidence)")
+    ap.add_argument("-o", "--out", metavar="DIR", help="where to write the report/TSVs (default: first --evidence)")
+    ap.add_argument("--repo", action="append", default=[], metavar="OWNER/NAME",
+                    help="only these repos (repeatable; default: all in the evidence)")
+    ap.add_argument("--since-time", metavar="ISO",
+                    help="compromise time, e.g. 2026-10-23T14:45:00Z (default: earliest executed attacker run)")
+    ap.add_argument("--ignore-identity", action="append", default=[], metavar="NAME",
+                    help="drop an auto-detected identity (e.g. a bot whose routine work is noise); repeatable")
+    ap.add_argument("--identity", action="append", default=[], metavar="NAME",
+                    help="extra login/name/email to flag in commits (repeatable)")
+    ap.add_argument("--docker-image", action="append", default=[], metavar="NS/NAME",
+                    help="Docker Hub image to check, if not detected from workflows (repeatable)")
+    ap.add_argument("--deep", action="store_true",
+                    help="search secret names in all files and full history (slower), not just .github/")
+    ap.add_argument("--no-registry", action="store_true", help="skip npm/PyPI/Docker Hub/GitHub release lookups")
+    ap.add_argument("--no-events", action="store_true",
+                    help="skip GitHub's repo events feed (server-side push and branch create/delete times)")
+    ap.add_argument("--ref-pattern", default=r"(?<![a-z0-9])zz[a-z0-9_-]", metavar="REGEX",
+                    help="branch/tag names treated as attacker refs in the timeline (default: zz names)")
+    ap.add_argument("--no-color", action="store_true", help="disable colored output")
+    a = ap.parse_args()
+    global USE_COLOR, USE_COLOR_OUT
+    if a.no_color:
+        USE_COLOR = USE_COLOR_OUT = False
+
+    evidence = a.evidence or ["evidence"]
+    out = Path(a.out or evidence[0])
+    out.mkdir(parents=True, exist_ok=True)
+    repos = load_repos(evidence, set(a.repo))
+    log(f"{len(repos)} repo(s) in {', '.join(evidence)}", "head")
+
+    executed = [(r, run) for r in repos for run in executed_attacker_runs(r)]
+    if a.since_time:
+        since = parse_time(a.since_time) or die(f"can't parse --since-time {a.since_time!r}")
+        since_src = "--since-time"
+    else:
+        cands = [parse_time(run["created_at"]) for _, run in executed]
+        src = "earliest executed attacker run"
+        if not cands:
+            cands = [parse_time(run["created_at"]) for r in repos for run in r["runs"] if run.get("flagged") == "strong"]
+            src = "earliest flagged run"
+        cands = [c for c in cands if c]
+        if not cands:
+            die("no flagged runs in the evidence; pass --since-time to set the compromise time")
+        since, since_src = min(cands), src
+    log(f"compromise time {iso(since)} UTC ({since_src})")
+
+    log("1/6 secrets read by executed attacker runs")
+    secrets = analyze_secrets(repos)
+    secret_names = sorted({r["secret"] for r in secrets if not r["secret"].startswith("(")})
+    log(f"2/6 searching for {len(secret_names)} secret name(s) across {len(repos)} mirror(s)"
+        + (" (deep)" if a.deep else ""))
+    names = name_exposure(repos, secret_names, a.deep)
+    log("3/6 artifact integrity")
+    arts = artifact_checks(repos)
+    rel, rel_notes = [], []
+    if not a.no_registry:
+        log("4/6 npm / PyPI / Docker Hub / GitHub releases")
+        rel, rel_notes = registry_checks(repos, since, find_token(), a.docker_image)
+    ids = [i for i in identities_of(repos, a.identity) if i not in {x.lower() for x in a.ignore_identity}]
+    log("5/6 commits and tags since the compromise")
+    cm = commits_since(repos, since, ids)
+    tags = tags_since(repos, since)
+    log("6/6 building the timeline" + ("" if a.no_events else " (incl. GitHub events feed)"))
+    try:
+        ref_rx = re.compile(a.ref_pattern, re.I)
+    except re.error as e:
+        die(f"bad --ref-pattern: {e}")
+    timeline, reach = build_timeline(repos, set(ids), ref_rx, cm, tags, rel, not a.no_events, find_token(), out,
+                                     since)
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    tsvs = {
+        "impact_secrets.tsv": (secrets, ["repo", "run_id", "workflow", "created_at", "secret", "env_var", "status", "note"]),
+        "impact_secret_names.tsv": (names, ["secret", "repo", "current_files", "first_seen_commit",
+                                            "first_seen_date", "first_seen_author"]),
+        "impact_artifacts.tsv": (arts, ["repo", "run_id", "file", "bytes", "sha256", "log_sha256", "match"]),
+        "impact_releases.tsv": (rel, ["registry", "repo", "package", "version", "published_utc", "published_by",
+                                      "after_compromise", "repo_note", "url"]),
+        "impact_commits.tsv": (cm, ["repo", "commit", "committed_utc", "tz", "author", "committer",
+                                    "identity_of_interest", "subject"]),
+        "impact_tags.tsv": (tags, ["repo", "tag", "created_utc", "commit", "tagger"]),
+        "impact_timeline.tsv": (timeline, ["epoch", "utc", "precision", "repo", "source", "event", "actor",
+                                           "run_id", "ref", "sha", "detail"]),
+    }
+    for fn, (rows, fields) in tsvs.items():
+        write_tsv(out / fn, rows, fields)
+
+    ctx = {"generated": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), "evidence": evidence,
+           "repos": repos, "hit_repos": sorted({r["name"] for r, _ in executed}), "since": since,
+           "since_src": since_src, "ids": ids, "secrets": secrets, "secret_names": secret_names,
+           "names": names, "deep": a.deep, "artifacts": arts, "releases": rel, "release_notes": rel_notes,
+           "no_registry": a.no_registry, "commits": cm, "tags": tags, "timeline": timeline, "events_reach": reach,
+           "files": [str(out / f) for f in tsvs] + [str(out / "impact.txt")]}
+    plain = render(ctx, color=False)
+    for fn in (f"impact_{stamp}.txt", "impact.txt"):
+        (out / fn).write_text(plain, encoding="utf-8")
+    try:
+        sys.stdout.write(render(ctx, color=USE_COLOR_OUT))
+    except UnicodeEncodeError:
+        sys.stdout.write(plain.encode("ascii", "replace").decode())
+    log(f"report saved to {out / 'impact.txt'}", "ok")
+
+
+if __name__ == "__main__":
+    main()

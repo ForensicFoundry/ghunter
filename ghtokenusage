@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""
+ghtokenusage - show how much of the GitHub API hourly quota a token has used.
+
+Built as a companion to ghworkflowhunt: by default it reads the token from the
+GITHUB_TOKEN = "..." line in ghworkflowhunt in the
+same directory as this script, so it reports on exactly the token the hunt is
+using. Checking the rate limit does not count against the quota.
+
+Token lookup order:
+  1. --script FILE      a script containing a GITHUB_TOKEN = "..." line
+  2. ghworkflowhunt / gh_workflow_hunt.py next to this script (if the line is set)
+  3. the GITHUB_TOKEN or GH_TOKEN environment variable
+
+Examples:
+  ghtokenusage                 one-time check
+  ghtokenusage -w              live view, refresh every 10s (Ctrl-C to quit)
+  ghtokenusage -w 30           refresh every 30s
+  ghtokenusage -a              also show search, GraphQL and other quotas
+  ghtokenusage --json          machine-readable output
+
+Color is used only when output goes to a terminal; set NO_COLOR=1 or pass
+--no-color to turn it off. Exit status: 0 OK, 1 error, 2 quota exhausted.
+
+Requires: Python 3.8+. No third-party packages.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+__version__ = "26.09.01"
+
+API = "https://api.github.com/rate_limit"
+SIBLING_SCRIPTS = ("ghworkflowhunt", "ghworkflowhunt.py")
+
+if os.name == "nt":
+    os.system("")
+
+
+# --------------------------------------------------------------------------- output
+
+def _color_enabled(stream):
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return hasattr(stream, "isatty") and stream.isatty() and os.environ.get("TERM") != "dumb"
+
+
+USE_COLOR = _color_enabled(sys.stdout)
+_STYLES = {"ok": "32", "warn": "33", "error": "1;31", "head": "1;36", "dim": "2",
+           "bold": "1", "flag": "1;35"}
+
+
+def paint(text, style):
+    code = _STYLES.get(style, style)
+    return f"\033[{code}m{text}\033[0m" if USE_COLOR and code else text
+
+
+def _unicode_ok():
+    enc = (getattr(sys.stdout, "encoding", None) or "").lower()
+    return "utf" in enc
+
+
+FULL, EMPTY, RULE = ("█", "░", "─") if _unicode_ok() else ("#", ".", "-")
+
+
+def die(msg, code=1):
+    print(paint(f"ghtokenusage: {msg}", "error"), file=sys.stderr)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------- token
+
+TOKEN_LINE = re.compile(r"""^GITHUB_TOKEN\s*=\s*["']([^"']*)["']""", re.MULTILINE)
+
+
+def token_from_script(path):
+    try:
+        m = TOKEN_LINE.search(Path(path).read_text(encoding="utf-8", errors="replace"))
+    except OSError as e:
+        die(f"can't read {path}: {e.strerror}")
+    return m.group(1).strip() if m else ""
+
+
+def find_token(script_arg):
+    """Return (token, where-it-came-from)."""
+    if script_arg:
+        if not Path(script_arg).is_file():
+            die(f"no such file: {script_arg}")
+        tok = token_from_script(script_arg)
+        if not tok:
+            die(f'no GITHUB_TOKEN = "..." value set in {script_arg}')
+        return tok, Path(script_arg).name
+    here = Path(__file__).resolve().parent
+    for name in SIBLING_SCRIPTS:
+        p = here / name
+        if p.is_file():
+            tok = token_from_script(p)
+            if tok:
+                return tok, name
+    for var in ("GITHUB_TOKEN", "GH_TOKEN"):
+        if os.environ.get(var, "").strip():
+            return os.environ[var].strip(), f"${var}"
+    die("no token found. Set GITHUB_TOKEN in ghworkflowhunt (same directory as this "
+        "script), export GITHUB_TOKEN, or use --script FILE.")
+
+
+def describe_token(tok):
+    kinds = [("github_pat_", "fine-grained PAT"), ("ghp_", "classic PAT"), ("gho_", "OAuth token"),
+             ("ghu_", "GitHub App user token"), ("ghs_", "GitHub App installation token"),
+             ("ghr_", "refresh token")]
+    prefix = next((p for p, _ in kinds if tok.startswith(p)), "")
+    kind = dict(kinds).get(prefix, "unknown type")
+    # Show the type prefix plus 4 characters on each side; never the full token
+    masked = f"{tok[:len(prefix) + 4]}…{tok[-4:]}" if len(tok) > len(prefix) + 12 else "…"
+    return masked, kind
+
+
+# --------------------------------------------------------------------------- API
+
+def fetch(token):
+    req = urllib.request.Request(API, headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": f"ghtokenusage/{__version__}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            die("GitHub rejected the token (401): mistyped, expired, or revoked.")
+        die(f"GitHub returned HTTP {e.code}: {e.read()[:200].decode('utf-8', 'replace')}")
+    except urllib.error.URLError as e:
+        die(f"can't reach api.github.com: {e.reason}")
+
+
+# --------------------------------------------------------------------------- rendering
+
+def fmt_dur(seconds):
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m:02d}m" if h else (f"{m}m {s:02d}s" if m else f"{s}s")
+
+
+def level(remaining, limit):
+    if limit <= 60:
+        return "error", "Unauthenticated (60/hour): GitHub isn't accepting this token"
+    if remaining == 0:
+        return "error", "EXHAUSTED: ghworkflowhunt is paused until the reset"
+    pct = remaining / limit * 100
+    if pct < 10:
+        return "error", "Nearly exhausted: ghworkflowhunt will pause soon"
+    if pct < 25:
+        return "warn", "Getting low"
+    return "ok", "OK: plenty of calls left"
+
+
+def bar(used, limit, style, width=32):
+    filled = round(width * used / limit) if limit else 0
+    return paint(FULL * filled, style) + paint(EMPTY * (width - filled), "dim")
+
+
+def render(data, masked, kind, source, show_all, pace=None, watching=None):
+    core = data["resources"]["core"]
+    limit, used, remaining, reset = core["limit"], core["used"], core["remaining"], core["reset"]
+    now = time.time()
+    style, verdict = level(remaining, limit)
+    pct = used / limit * 100 if limit else 0
+    W = 66
+    L = [paint(f" GitHub API token usage".ljust(W - 17) + f"ghtokenusage {__version__}", "head"),
+         paint(RULE * W, "dim")]
+
+    def kv(k, v):
+        L.append(f"  {paint(k.ljust(12), 'bold')}{v}")
+
+    kv("Token", f"{masked}  {paint('(' + kind + ')', 'dim')}  {paint('from ' + source, 'dim')}")
+    kv("Checked", datetime.now().strftime("%H:%M:%S") + paint("  local time", "dim")
+       + (paint(f"  · refreshing every {watching}s, Ctrl-C to quit", "dim") if watching else ""))
+    L.append("")
+    kv("Core API", f"{bar(used, limit, style)}  {paint(f'{pct:4.1f}% used', style)}")
+    kv("", f"{paint(f'{used:,}', 'bold')} used · {paint(f'{remaining:,}', style)} remaining · "
+           f"{limit:,} per hour")
+    kv("Resets", datetime.fromtimestamp(reset).strftime("%H:%M:%S")
+       + paint(f"  local · in {fmt_dur(reset - now)}", "dim"))
+    if pace == "measuring":
+        kv("Pace", paint("measuring… (shown from the next refresh)", "dim"))
+    elif pace is not None:
+        if pace <= 0:
+            kv("Pace", paint("no calls since the last refresh", "dim"))
+        else:
+            left = remaining / pace * 60  # seconds until exhausted at this pace
+            if left < reset - now:
+                note = paint(f"runs out in ~{fmt_dur(left)}, before the reset: expect a pause", "warn")
+            else:
+                note = paint("enough to last until the reset", "ok")
+            kv("Pace", f"~{pace:,.0f} calls/min · {note}")
+    kv("Status", paint(verdict, style))
+
+    if show_all:
+        L += ["", f"  {paint('Other quotas', 'bold')}"]
+        L.append(paint(f"    {'Resource':<28}{'Used':>8}{'Left':>9}{'Limit':>9}  Resets", "dim"))
+        for name, r in sorted(data["resources"].items()):
+            if name == "core":
+                continue
+            st, _ = level(r["remaining"], r["limit"]) if r["limit"] > 60 else \
+                (("ok", "") if r["remaining"] else ("error", ""))
+            left = paint(format(r["remaining"], ">9,"), st)
+            resets = datetime.fromtimestamp(r["reset"]).strftime("%H:%M:%S")
+            L.append(f"    {name:<28}{r['used']:>8,}{left}{r['limit']:>9,}  {resets}")
+    return "\n".join(L), (2 if remaining == 0 and limit > 60 else 0)
+
+
+# --------------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(prog="ghtokenusage", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
+    ap.add_argument("-w", "--watch", nargs="?", type=int, const=10, metavar="SECONDS",
+                    help="keep refreshing (default every 10s) and show the current pace")
+    ap.add_argument("-a", "--all", action="store_true", help="also show non-core quotas (search, GraphQL…)")
+    ap.add_argument("--script", metavar="FILE", help='read the token from FILE\'s GITHUB_TOKEN = "..." line')
+    ap.add_argument("--json", action="store_true", help="print machine-readable JSON and exit")
+    ap.add_argument("--no-color", action="store_true", help="disable colored output")
+    a = ap.parse_args()
+    global USE_COLOR
+    if a.no_color or a.json:
+        USE_COLOR = False
+    if a.watch is not None and a.watch < 2:
+        die("--watch interval must be at least 2 seconds")
+
+    token, source = find_token(a.script)
+    masked, kind = describe_token(token)
+
+    if a.json:
+        data = fetch(token)
+        core = dict(data["resources"]["core"])
+        core["resets_at"] = datetime.fromtimestamp(core["reset"]).strftime("%H:%M:%S")
+        core["resets_in_seconds"] = max(0, int(core["reset"] - time.time()))
+        out = {"token": masked, "token_type": kind, "source": source, "core": core}
+        if a.all:
+            out["resources"] = data["resources"]
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        sys.exit(2 if core["remaining"] == 0 and core["limit"] > 60 else 0)
+
+    if a.watch is None:
+        text, code = render(fetch(token), masked, kind, source, a.all)
+        print(text)
+        sys.exit(code)
+
+    # Watch mode: redraw in place in a terminal; append blocks otherwise.
+    first = None  # (time, used, reset) at the start of the current quota window
+    prev = None
+    try:
+        while True:
+            data = fetch(token)
+            core = data["resources"]["core"]
+            now = time.monotonic()
+            if first is None or abs(core["reset"] - first[2]) > 60 or core["used"] < first[1]:
+                first = (now, core["used"], core["reset"])  # new hourly window: restart pace
+            pace = "measuring"
+            if prev is not None and now - first[0] >= 1:
+                pace = (core["used"] - first[1]) / ((now - first[0]) / 60)
+            prev = core["used"]
+            text, _ = render(data, masked, kind, source, a.all, pace=pace, watching=a.watch)
+            if sys.stdout.isatty():
+                sys.stdout.write("\033[2J\033[H" + text + "\n")
+            else:
+                sys.stdout.write(text + "\n\n")
+            sys.stdout.flush()
+            time.sleep(a.watch)
+    except KeyboardInterrupt:
+        print()
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
